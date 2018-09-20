@@ -61,8 +61,12 @@ sys_futex(void *uaddr, int op, int val)
 #if defined(__powerpc64__)
 #include <sys/platform/ppc.h>
 #define cpu_relax() __ppc_get_timebase()
+#define cpu_low() __ppc_set_ppr_low()
+#define cpu_medium() __ppc_set_ppr_med()
 #else
 #define cpu_relax() asm volatile("pause\n": : :"memory")
+#define cpu_low()
+#define cpu_medium()
 #endif
 
 #define unlikely(__expr) __builtin_expect(!! (__expr), 0)
@@ -116,8 +120,10 @@ cf_mutex_trylock(cf_mutex *m)
 void
 cf_mutex_lock_spin(cf_mutex *m)
 {
+	cpu_low();
 	for (int i = 0; i < FUTEX_SPIN_MAX; i++) {
 		if (cmpxchg((uint32_t *)m, 0, 1) == 0) {
+			cpu_medium();
 			return; // was not locked
 		}
 
@@ -131,13 +137,16 @@ cf_mutex_lock_spin(cf_mutex *m)
 	while (xchg((uint32_t *)m, 2) != 0) {
 		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
 	}
+	cpu_medium();
 }
 
 void
 cf_mutex_unlock_spin(cf_mutex *m)
 {
-	uint32_t check = xchg((uint32_t *)m, 0);
+	uint32_t check;
 
+	cpu_low();
+	check = xchg((uint32_t *)m, 0);
 	if (unlikely(check == 2)) {
 		// Spin and hope someone takes the lock.
 		for (int i = 0; i < FUTEX_SPIN_MAX; i++) {
@@ -146,6 +155,7 @@ cf_mutex_unlock_spin(cf_mutex *m)
 					break;
 				}
 
+				cpu_medium();
 				return; // someone else took the lock
 			}
 
@@ -155,8 +165,10 @@ cf_mutex_unlock_spin(cf_mutex *m)
 		sys_futex(m, FUTEX_WAKE_PRIVATE, 1);
 	}
 	else if (unlikely(check == 0)) {
+		cpu_medium();
 		cf_crash(CF_MISC, "cf_mutex_unlock_spin() on already unlocked mutex");
 	}
+	cpu_medium();
 }
 
 
@@ -169,8 +181,10 @@ cf_condition_wait(cf_condition *c, cf_mutex *m)
 {
 	uint32_t seq = c->seq;
 
+	cpu_low();
 	cf_mutex_unlock(m);
 	sys_futex(&c->seq, FUTEX_WAIT_PRIVATE, seq);
+	cpu_medium();
 	cf_mutex_lock(m);
 }
 
