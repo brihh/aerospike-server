@@ -105,7 +105,11 @@ struct nvme_admin_cmd {
 #define INVALID_INDEX ((uint16_t)-1)
 #define POLICY_SCRIPT "/etc/aerospike/irqbalance-ban.sh"
 
+#if defined(__powerpc64__)
+#define MEM_PAGE_SIZE (65536L)
+#else
 #define MEM_PAGE_SIZE (4096L)
+#endif
 
 typedef enum {
 	FILE_RES_OK,
@@ -134,6 +138,7 @@ typedef struct {
 static cpu_set_t g_os_cpus_online;
 static cpu_set_t g_numa_node_os_cpus_online[CPU_SETSIZE];
 
+static uint16_t g_max_num_cpus;
 static uint16_t g_n_numa_nodes;
 static uint16_t g_n_cores;
 static uint16_t g_n_os_cpus;
@@ -182,6 +187,16 @@ static cf_shash *g_dev_graph;
 
 static pthread_mutex_t g_path_data_lock = PTHREAD_MUTEX_INITIALIZER;
 static cf_shash *g_path_data;
+
+#if 1                                                                                                                                               
+//bri                                                                                                                                               
+#undef cf_debug                                                                                                                                     
+#undef cf_detail                                                                                                                                    
+//#define cf_debug(...) __SEVLOG(CF_INFO, ##__VA_ARGS__)                                                                                            
+//#define cf_detail(...) __SEVLOG(CF_INFO, ##__VA_ARGS__)                                                                                           
+#define cf_debug(A,...) { printf(__VA_ARGS__);printf("\n");}                                                                                        
+#define cf_detail(A,...) { printf(__VA_ARGS__);printf("\n");}                                                                                       
+#endif                                                                                                                                              
 
 static file_res
 read_file(const char *path, void *buff, size_t *limit)
@@ -478,7 +493,7 @@ read_value(const char *path, int64_t *val)
 	char *end;
 	int64_t x = strtol(buff, &end, 10);
 
-	if (*end != '\0' || x >= CPU_SETSIZE) {
+	if (*end != '\0') {
 		cf_warning(CF_HARDWARE, "invalid value \"%s\" in %s", buff, path);
 		return FILE_RES_ERROR;
 	}
@@ -620,6 +635,13 @@ detect(cf_topo_numa_node_index a_numa_node)
 		cf_detail(CF_HARDWARE, "detecting online CPUs on NUMA node %hu", a_numa_node);
 	}
 
+	// read kernel_max - highest CPU/Core number possible
+
+	if (read_index("/sys/devices/system/cpu/kernel_max", &g_max_num_cpus) != FILE_RES_OK) {
+		cf_crash(CF_HARDWARE, "error while reading cpu/kernel_max");
+	}
+	g_max_num_cpus++;
+
 	if (read_list("/sys/devices/system/cpu/online", &g_os_cpus_online) != FILE_RES_OK) {
 		cf_crash(CF_HARDWARE, "error while reading list of online CPUs");
 	}
@@ -640,12 +662,13 @@ detect(cf_topo_numa_node_index a_numa_node)
 	}
 
 	cpu_set_t covered_numa_nodes;
-	cpu_set_t covered_cores[CPU_SETSIZE]; // One mask per package.
+	cpu_set_t *covered_cores[CPU_SETSIZE]; // One mask per package.
 
 	CPU_ZERO(&covered_numa_nodes);
 
 	for (int32_t i = 0; i < CPU_SETSIZE; ++i) {
-		CPU_ZERO(&covered_cores[i]);
+		covered_cores[i] = CPU_ALLOC(g_max_num_cpus);
+		CPU_ZERO_S(g_max_num_cpus, covered_cores[i]);
 	}
 
 	g_n_numa_nodes = 0;
@@ -660,6 +683,13 @@ detect(cf_topo_numa_node_index a_numa_node)
 	for (g_n_os_cpus = 0; g_n_os_cpus < CPU_SETSIZE; ++g_n_os_cpus) {
 		cf_detail(CF_HARDWARE, "querying OS CPU index %hu", g_n_os_cpus);
 
+		// Only consider CPUs that are actually in use.
+
+		if (!CPU_ISSET(g_n_os_cpus, &g_os_cpus_online)) {
+			cf_detail(CF_HARDWARE, "OS CPU index %hu is offline", g_n_os_cpus);
+			continue;
+		}
+
 		// Let's look at the CPU's package.
 
 		snprintf(path, sizeof(path),
@@ -668,13 +698,6 @@ detect(cf_topo_numa_node_index a_numa_node)
 		os_package_index i_os_package;
 		file_res res = read_index(path, &i_os_package);
 
-		// The entry doesn't exist. We've processed all available CPUs. Stop
-		// looping through the CPUs.
-
-		if (res == FILE_RES_NOT_FOUND) {
-			break;
-		}
-
 		if (res != FILE_RES_OK) {
 			cf_crash(CF_HARDWARE, "error while reading OS package index from %s", path);
 			break;
@@ -682,15 +705,8 @@ detect(cf_topo_numa_node_index a_numa_node)
 
 		cf_detail(CF_HARDWARE, "OS package index is %hu", i_os_package);
 
-		// Only consider CPUs that are actually in use.
-
-		if (!CPU_ISSET(g_n_os_cpus, &g_os_cpus_online)) {
-			cf_detail(CF_HARDWARE, "OS CPU index %hu is offline", g_n_os_cpus);
-			continue;
-		}
-
-		// Let's look at the CPU's underlying core. In Hyper Threading systems,
-		// two (logical) CPUs share one (physical) core.
+		// Let's look at the CPU's underlying core. In Hyper Threading and SMT systems,
+		// two or more (logical) CPUs share one (physical) core.
 
 		snprintf(path, sizeof(path),
 				"/sys/devices/system/cpu/cpu%hu/topology/core_id",
@@ -710,14 +726,14 @@ detect(cf_topo_numa_node_index a_numa_node)
 
 		bool new_core;
 
-		if (CPU_ISSET(i_os_core, &covered_cores[i_os_package])) {
+		if (CPU_ISSET_S(i_os_core, g_max_num_cpus, covered_cores[i_os_package])) {
 			cf_detail(CF_HARDWARE, "core (%hu, %hu) already covered", i_os_core, i_os_package);
 			new_core = false;
 		}
 		else {
 			cf_detail(CF_HARDWARE, "core (%hu, %hu) is new", i_os_core, i_os_package);
 			new_core = true;
-			CPU_SET(i_os_core, &covered_cores[i_os_package]);
+			CPU_SET_S(i_os_core, g_max_num_cpus, covered_cores[i_os_package]);
 		}
 
 		// Identify the NUMA node of the current CPU. We simply look for the
@@ -821,10 +837,6 @@ detect(cf_topo_numa_node_index a_numa_node)
 
 		cf_detail(CF_HARDWARE, "OS CPU index %hu <-> CPU index %hu", g_n_os_cpus, g_n_cpus);
 		++g_n_cpus;
-	}
-
-	if (g_n_os_cpus == CPU_SETSIZE) {
-		cf_crash(CF_HARDWARE, "too many CPUs");
 	}
 
 	if (a_numa_node != INVALID_INDEX && no_numa) {
