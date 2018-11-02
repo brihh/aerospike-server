@@ -55,11 +55,9 @@ sys_futex(void *uaddr, int op, int val)
 	syscall(SYS_futex, uaddr, op, val, NULL, NULL, 0);
 }
 
-#define xchg_acq(__ptr, __val) __atomic_test_and_set(__ptr, __ATOMIC_ACQUIRE)
-#define xchg_rel(__ptr, __val) __atomic_test_and_set(__ptr, __ATOMIC_RELEASE)
+#define xchg(__ptr, __val) __sync_lock_test_and_set(__ptr, __val)
+#define cmpxchg(__ptr, __cmp, __set) __sync_val_compare_and_swap(__ptr, __cmp, __set)
 
-#define cmpxchg_acq(__ptr, __cmp, __set) __atomic_compare_exchange_n((__ptr), (__cmp), (__set), false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)
-#define cmpxchg_rel(__ptr, __cmp, __set) __atomic_compare_exchange_n(__ptr, __cmp, __set, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)
 #if defined(__powerpc64__)
 #include <sys/platform/ppc.h>
 #define cpu_relax() __ppc_get_timebase()
@@ -78,31 +76,18 @@ sys_futex(void *uaddr, int op, int val)
 void
 cf_mutex_lock(cf_mutex *m)
 {
-	uint32_t expt = 0;
-	
-	if (likely(cmpxchg_acq((uint32_t *)m, &expt, 1) == true)) {
-		return; // was not locked
-	}
-
-	if (m->u32 == 2) {
-		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
-	}
-
-	while (xchg_acq((uint32_t *)m, 2) != 0) {
-		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
+	int rc = pthread_mutex_lock(m);
+	if (unlikely(rc != 0)) {
+		cf_crash(CF_MISC, "cf_mutex_lock() failed");
 	}
 }
 
 void
 cf_mutex_unlock(cf_mutex *m)
 {
-	uint32_t check = xchg_rel((uint32_t *)m, 0);
-
-	if (unlikely(check == 2)) {
-		sys_futex(m, FUTEX_WAKE_PRIVATE, 1);
-	}
-	else if (unlikely(check == 0)) {
-		cf_crash(CF_MISC, "cf_mutex_unlock() on already unlocked mutex");
+	int rc = pthread_mutex_unlock(m);
+	if (unlikely(rc != 0)) {
+		cf_crash(CF_MISC, "cf_mutex_unlock() failed");
 	}
 }
 
@@ -110,61 +95,25 @@ cf_mutex_unlock(cf_mutex *m)
 bool
 cf_mutex_trylock(cf_mutex *m)
 {
-	uint32_t expt = 0;
-	
-	if (cmpxchg_acq((uint32_t *)m, &expt, 1) == true) {
-		return true; // was not locked
-	}
-
-	return false;
+	int rc = pthread_mutex_lock(m);
+	return rc;
 }
 
 void
 cf_mutex_lock_spin(cf_mutex *m)
 {
-	uint32_t expt = 0;
-	
-	for (int i = 0; i < FUTEX_SPIN_MAX; i++) {
-		if (cmpxchg_acq((uint32_t *)m, &expt, 1) == true) {
-			return; // was not locked
-		}
-
-		cpu_relax();
-	}
-
-	if (m->u32 == 2) {
-		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
-	}
-
-	while (xchg_acq((uint32_t *)m, 2) != 0) {
-		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
+	int rc = pthread_mutex_lock(m);
+	if (unlikely(rc != 0)) {
+		cf_crash(CF_MISC, "cf_mutex_lock_spin() failed");
 	}
 }
 
 void
 cf_mutex_unlock_spin(cf_mutex *m)
 {
-	uint32_t expt = 1;
-	uint32_t check = xchg_rel((uint32_t *)m, 0);
-
-	if (unlikely(check == 2)) {
-		// Spin and hope someone takes the lock.
-		for (int i = 0; i < FUTEX_SPIN_MAX; i++) {
-			if (m->u32 != 0) {
-				if (cmpxchg_rel((uint32_t *)m, &expt, 2) == 0) {
-					break;
-				}
-
-				return; // someone else took the lock
-			}
-
-			cpu_relax();
-		}
-
-		sys_futex(m, FUTEX_WAKE_PRIVATE, 1);
-	}
-	else if (unlikely(check == 0)) {
-		cf_crash(CF_MISC, "cf_mutex_unlock_spin() on already unlocked mutex");
+	int rc = pthread_mutex_unlock(m);
+	if (unlikely(rc != 0)) {
+		cf_crash(CF_MISC, "cf_mutex_unlock_spin() failed");
 	}
 }
 
@@ -176,16 +125,18 @@ cf_mutex_unlock_spin(cf_mutex *m)
 void
 cf_condition_wait(cf_condition *c, cf_mutex *m)
 {
-	uint32_t seq = c->seq;
-
-	cf_mutex_unlock(m);
-	sys_futex(&c->seq, FUTEX_WAIT_PRIVATE, seq);
-	cf_mutex_lock(m);
+	int rc = pthread_cond_wait(c, m);
+	if (unlikely(rc != 0)) {
+		cf_crash(CF_MISC, "cf_condition_wait() failed");
+	}
 }
 
 void
 cf_condition_signal(cf_condition *c)
 {
-	__atomic_fetch_add(&c->seq, 1, __ATOMIC_ACQ_REL);
-	sys_futex(&c->seq, FUTEX_WAKE_PRIVATE, 1);
+	int rc = pthread_cond_signal(c);
+	if (unlikely(rc != 0)) {
+		cf_crash(CF_MISC, "cf_condition_signal() failed");
+	}
 }
+
