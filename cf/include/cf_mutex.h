@@ -29,23 +29,19 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <pthread.h>
 
 
 //==========================================================
 // Typedefs & constants.
 //
 
-typedef struct cf_mutex_s {
-	uint32_t u32;
-} cf_mutex __attribute__ ((aligned(4)));
+#define cf_mutex pthread_mutex_t
+#define cf_condition pthread_cond_t
 
-typedef struct cf_condition_s {
-	uint32_t seq;
-} cf_condition __attribute__ ((aligned(4)));
-
-#define CF_MUTEX_INIT { 0 }
-#define cf_mutex_init(__m) (__m)->u32 = 0
-#define cf_mutex_destroy(__m) // no-op
+#define CF_MUTEX_INIT PTHREAD_MUTEX_INITIALIZER
+#define cf_mutex_init(__m) pthread_mutex_init(__m,NULL)
+#define cf_mutex_destroy(__m) pthread_mutex_destroy(__m)
 
 
 //==========================================================
