@@ -24,7 +24,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -41,6 +40,7 @@
 #include "citrusleaf/alloc.h"
 #include "citrusleaf/cf_b64.h"
 
+#include "cf_mutex.h"
 #include "shash.h"
 
 
@@ -49,8 +49,11 @@
  */
 #define MAX_BINARY_BUF_SZ (64 * 1024)
 
+// TODO - do we really need O_NONBLOCK for log sinks?
 #define SINK_OPEN_FLAGS (O_WRONLY | O_CREAT | O_NONBLOCK | O_APPEND)
 #define SINK_OPEN_MODE (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+
+#define SINK_REOPEN_FLAGS (O_WRONLY | O_CREAT | O_NONBLOCK | O_TRUNC)
 
 /* cf_fault_context_strings, cf_fault_severity_strings, cf_fault_scope_strings
  * Strings describing fault states */
@@ -68,6 +71,7 @@ char *cf_fault_context_strings[] = {
 		"socket",
 		"tls",
 		"vmapx",
+		"xmem",
 
 		"aggr",
 		"appeal",
@@ -76,13 +80,12 @@ char *cf_fault_context_strings[] = {
 		"bin",
 		"config",
 		"clustering",
-		"compression",
-		"demarshal",
 		"drv_ssd",
 		"exchange",
 		"fabric",
 		"geo",
 		"hb",
+		"health",
 		"hlc",
 		"index",
 		"info",
@@ -106,6 +109,8 @@ char *cf_fault_context_strings[] = {
 		"rw-client",
 		"scan",
 		"security",
+		"service",
+		"service-list",
 		"sindex",
 		"skew",
 		"smd",
@@ -113,7 +118,9 @@ char *cf_fault_context_strings[] = {
 		"truncate",
 		"tsvc",
 		"udf",
-		"xdr"
+		"xdr",
+		"xdr-client",
+		"xdr-http"
 };
 
 COMPILER_ASSERT(sizeof(cf_fault_context_strings) / sizeof(char*) == CF_FAULT_CONTEXT_UNDEF);
@@ -973,16 +980,14 @@ cf_fault_sink_logroll(void)
 	for (int i = 0; i < cf_fault_sinks_inuse; i++) {
 		cf_fault_sink *s = &cf_fault_sinks[i];
 		if ((0 != strncmp(s->path, "stderr", 6)) && (s->fd > 2)) {
-			int fd = s->fd;
-			s->fd = -1;
-			usleep(1);
+			int old_fd = s->fd;
 
-			// hopefully, the file has been relinked elsewhere - or you're OK losing it
-			unlink(s->path);
-			close(fd);
+			// Note - we use O_TRUNC, so we assume the file has been
+			// moved/copied elsewhere, or we're ok losing it.
+			s->fd = open(s->path, SINK_REOPEN_FLAGS, SINK_OPEN_MODE);
 
-			fd = open(s->path, SINK_OPEN_FLAGS, SINK_OPEN_MODE);
-			s->fd = fd;
+			usleep(1000); // threads may be interrupted while writing to old fd
+			close(old_fd);
 		}
 	}
 }
@@ -1089,13 +1094,13 @@ cf_fault_cache_event(cf_fault_context context, cf_fault_severity severity,
 
 	while (true) {
 		uint32_t *valp = NULL;
-		pthread_mutex_t *lockp = NULL;
+		cf_mutex *lockp = NULL;
 
 		if (cf_shash_get_vlock(g_ticker_hash, &key, (void**)&valp, &lockp) ==
 				CF_SHASH_OK) {
 			// Already in hash - increment count and don't log it.
 			(*valp)++;
-			pthread_mutex_unlock(lockp);
+			cf_mutex_unlock(lockp);
 			break;
 		}
 		// else - not found, add it to hash and log it.

@@ -34,6 +34,8 @@
 #   make stop    - Stop the server.
 #
 
+OS = $(shell build/os_version)
+
 # Common variable definitions:
 include make_in/Makefile.vars
 
@@ -46,7 +48,7 @@ endif
 	$(MAKE) -C $(JANSSON)
 	$(MAKE) -C $(COMMON) CF=$(CF) EXT_CFLAGS="$(EXT_CFLAGS)"
 	$(MAKE) -C $(CF)
-	$(MAKE) -C $(MOD_LUA) CF=$(CF) COMMON=$(COMMON) LUA_CORE=$(LUA_CORE) EXT_CFLAGS="$(EXT_CFLAGS)" USE_LUAJIT=$(USE_LUAJIT) LUAJIT=$(LUAJIT) TARGET_SERVER=1
+	$(MAKE) -C $(MOD_LUA) CF=$(CF) COMMON=$(COMMON) EXT_CFLAGS="$(EXT_CFLAGS)" USE_LUAJIT=$(USE_LUAJIT) LUAJIT=$(LUAJIT) TARGET_SERVER=1
 	$(MAKE) -C $(S2)
 	$(MAKE) -C ai
 	$(MAKE) -C as
@@ -63,8 +65,7 @@ strip:	server
 .PHONY: init start stop
 init:
 	@echo "Creating and initializing working directories..."
-	mkdir -p run/log run/work/smd run/work/sys/udf/lua run/work/usr/udf/lua
-	cp -pr modules/lua-core/src/* run/work/sys/udf/lua
+	mkdir -p run/log run/work/smd run/work/usr/udf/lua
 
 start:
 	@echo "Running the Aerospike Server locally..."
@@ -96,7 +97,7 @@ cleanmodules:
 	if [ -e "$(LUAJIT)/Makefile" ]; then \
 		$(MAKE) -C $(LUAJIT) clean; \
 	fi
-	$(MAKE) -C $(MOD_LUA) COMMON=$(COMMON) LUA_CORE=$(LUA_CORE) USE_LUAJIT=$(USE_LUAJIT) LUAJIT=$(LUAJIT) clean
+	$(MAKE) -C $(MOD_LUA) COMMON=$(COMMON) USE_LUAJIT=$(USE_LUAJIT) LUAJIT=$(LUAJIT) clean
 	$(MAKE) -C $(S2) clean
 
 .PHONY: cleandist
@@ -117,7 +118,6 @@ cleangit:
 	cd $(COMMON); $(GIT_CLEAN)
 	cd $(JANSSON); $(GIT_CLEAN)
 	cd $(JEMALLOC); $(GIT_CLEAN)
-	cd $(LUA_CORE); $(GIT_CLEAN)
 	cd $(LUAJIT); $(GIT_CLEAN)
 	cd $(MOD_LUA); $(GIT_CLEAN)
 	cd $(S2); $(GIT_CLEAN)
@@ -128,7 +128,7 @@ rpm deb tar src:
 	$(MAKE) -C pkg/$@ EDITION=$(EDITION)
 
 $(VERSION_SRC):	targetdirs
-	build/gen_version $(EDITION) $(shell $(DEPTH)/build/os_version) > $(VERSION_SRC)
+	build/gen_version $(EDITION) $(OS) > $(VERSION_SRC)
 
 $(VERSION_OBJ):	$(VERSION_SRC)
 	$(CC) -o $@ -c $<

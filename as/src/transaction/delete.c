@@ -26,7 +26,6 @@
 
 #include "transaction/delete.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -35,6 +34,7 @@
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_clock.h"
 
+#include "cf_mutex.h"
 #include "dynbuf.h"
 #include "fault.h"
 
@@ -81,28 +81,60 @@ client_delete_update_stats(as_namespace* ns, uint8_t result_code,
 		bool is_xdr_op)
 {
 	switch (result_code) {
-	case AS_PROTO_RESULT_OK:
+	case AS_OK:
 		cf_atomic64_incr(&ns->n_client_delete_success);
 		if (is_xdr_op) {
-			cf_atomic64_incr(&ns->n_xdr_delete_success);
+			cf_atomic64_incr(&ns->n_xdr_client_delete_success);
 		}
 		break;
-	case AS_PROTO_RESULT_FAIL_TIMEOUT:
+	case AS_ERR_TIMEOUT:
 		cf_atomic64_incr(&ns->n_client_delete_timeout);
 		if (is_xdr_op) {
-			cf_atomic64_incr(&ns->n_xdr_delete_timeout);
+			cf_atomic64_incr(&ns->n_xdr_client_delete_timeout);
 		}
 		break;
 	default:
 		cf_atomic64_incr(&ns->n_client_delete_error);
 		if (is_xdr_op) {
-			cf_atomic64_incr(&ns->n_xdr_delete_error);
+			cf_atomic64_incr(&ns->n_xdr_client_delete_error);
 		}
 		break;
-	case AS_PROTO_RESULT_FAIL_NOT_FOUND:
+	case AS_ERR_NOT_FOUND:
 		cf_atomic64_incr(&ns->n_client_delete_not_found);
 		if (is_xdr_op) {
-			cf_atomic64_incr(&ns->n_xdr_delete_not_found);
+			cf_atomic64_incr(&ns->n_xdr_client_delete_not_found);
+		}
+		break;
+	}
+}
+
+static inline void
+from_proxy_delete_update_stats(as_namespace* ns, uint8_t result_code,
+		bool is_xdr_op)
+{
+	switch (result_code) {
+	case AS_OK:
+		cf_atomic64_incr(&ns->n_from_proxy_delete_success);
+		if (is_xdr_op) {
+			cf_atomic64_incr(&ns->n_xdr_from_proxy_delete_success);
+		}
+		break;
+	case AS_ERR_TIMEOUT:
+		cf_atomic64_incr(&ns->n_from_proxy_delete_timeout);
+		if (is_xdr_op) {
+			cf_atomic64_incr(&ns->n_xdr_from_proxy_delete_timeout);
+		}
+		break;
+	default:
+		cf_atomic64_incr(&ns->n_from_proxy_delete_error);
+		if (is_xdr_op) {
+			cf_atomic64_incr(&ns->n_xdr_from_proxy_delete_error);
+		}
+		break;
+	case AS_ERR_NOT_FOUND:
+		cf_atomic64_incr(&ns->n_from_proxy_delete_not_found);
+		if (is_xdr_op) {
+			cf_atomic64_incr(&ns->n_xdr_from_proxy_delete_not_found);
 		}
 		break;
 	}
@@ -118,19 +150,19 @@ as_delete_start(as_transaction* tr)
 {
 	// Apply XDR filter.
 	if (! xdr_allows_write(tr)) {
-		tr->result_code = AS_PROTO_RESULT_FAIL_ALWAYS_FORBIDDEN;
+		tr->result_code = AS_ERR_ALWAYS_FORBIDDEN;
 		send_delete_response(tr);
 		return TRANS_DONE_ERROR;
 	}
 
 	if (! validate_delete_durability(tr)) {
-		tr->result_code = AS_PROTO_RESULT_FAIL_FORBIDDEN;
+		tr->result_code = AS_ERR_FORBIDDEN;
 		send_delete_response(tr);
 		return TRANS_DONE_ERROR;
 	}
 
 	if (delete_storage_overloaded(tr)) {
-		tr->result_code = AS_PROTO_RESULT_FAIL_DEVICE_OVERLOAD;
+		tr->result_code = AS_ERR_DEVICE_OVERLOAD;
 		send_delete_response(tr);
 		return TRANS_DONE_ERROR;
 	}
@@ -152,8 +184,7 @@ as_delete_start(as_transaction* tr)
 	}
 	// else - rw_request is now in hash, continue...
 
-	if (tr->rsv.ns->write_dup_res_disabled ||
-			as_transaction_is_nsup_delete(tr)) {
+	if (tr->rsv.ns->write_dup_res_disabled) {
 		// Note - preventing duplicate resolution this way allows
 		// rw_request_destroy() to handle dup_msg[] cleanup correctly.
 		tr->rsv.n_dupl = 0;
@@ -175,7 +206,7 @@ as_delete_start(as_transaction* tr)
 
 	if (insufficient_replica_destinations(tr->rsv.ns, rw->n_dest_nodes)) {
 		rw_request_hash_delete(&hkey, rw);
-		tr->result_code = AS_PROTO_RESULT_FAIL_UNAVAILABLE;
+		tr->result_code = AS_ERR_UNAVAILABLE;
 		send_delete_response(tr);
 		return TRANS_DONE_ERROR;
 	}
@@ -200,7 +231,7 @@ as_delete_start(as_transaction* tr)
 	}
 
 	// If we don't need to wait for replica write acks, fire and forget.
-	if (as_transaction_is_nsup_delete(tr) || respond_on_master_complete(tr)) {
+	if (respond_on_master_complete(tr)) {
 		start_delete_repl_write_forget(rw, tr);
 		rw_request_hash_delete(&hkey, rw);
 		send_delete_response(tr);
@@ -225,12 +256,12 @@ start_delete_dup_res(rw_request* rw, as_transaction* tr)
 
 	dup_res_make_message(rw, tr);
 
-	pthread_mutex_lock(&rw->lock);
+	cf_mutex_lock(&rw->lock);
 
 	dup_res_setup_rw(rw, tr, delete_dup_res_cb, delete_timeout_cb);
 	send_rw_messages(rw);
 
-	pthread_mutex_unlock(&rw->lock);
+	cf_mutex_unlock(&rw->lock);
 }
 
 
@@ -241,12 +272,12 @@ start_delete_repl_write(rw_request* rw, as_transaction* tr)
 
 	repl_write_make_message(rw, tr);
 
-	pthread_mutex_lock(&rw->lock);
+	cf_mutex_lock(&rw->lock);
 
 	repl_write_setup_rw(rw, tr, delete_repl_write_cb, delete_timeout_cb);
 	send_rw_messages(rw);
 
-	pthread_mutex_unlock(&rw->lock);
+	cf_mutex_unlock(&rw->lock);
 }
 
 
@@ -266,7 +297,7 @@ delete_dup_res_cb(rw_request* rw)
 	as_transaction tr;
 	as_transaction_init_from_rw(&tr, rw);
 
-	if (tr.result_code != AS_PROTO_RESULT_OK) {
+	if (tr.result_code != AS_OK) {
 		send_delete_response(&tr);
 		return true;
 	}
@@ -276,7 +307,7 @@ delete_dup_res_cb(rw_request* rw)
 			rw->dest_nodes);
 
 	if (insufficient_replica_destinations(tr.rsv.ns, rw->n_dest_nodes)) {
-		tr.result_code = AS_PROTO_RESULT_FAIL_UNAVAILABLE;
+		tr.result_code = AS_ERR_UNAVAILABLE;
 		send_delete_response(&tr);
 		return true;
 	}
@@ -361,7 +392,7 @@ void
 send_delete_response(as_transaction* tr)
 {
 	// Paranoia - shouldn't get here on losing race with timeout.
-	if (! tr->from.any && tr->origin != FROM_NSUP) {
+	if (! tr->from.any) {
 		cf_warning(AS_RW, "transaction origin %u has null 'from'", tr->origin);
 		return;
 	}
@@ -380,8 +411,8 @@ send_delete_response(as_transaction* tr)
 		as_proxy_send_response(tr->from.proxy_node, tr->from_data.proxy_tid,
 				tr->result_code, 0, 0, NULL, NULL, 0, tr->rsv.ns,
 				as_transaction_trid(tr));
-		break;
-	case FROM_NSUP:
+		from_proxy_delete_update_stats(tr->rsv.ns, tr->result_code,
+				as_transaction_is_xdr(tr));
 		break;
 	default:
 		cf_crash(AS_RW, "unexpected transaction origin %u", tr->origin);
@@ -395,9 +426,6 @@ send_delete_response(as_transaction* tr)
 void
 delete_timeout_cb(rw_request* rw)
 {
-	// Paranoia - remove eventually.
-	cf_assert(rw->origin != FROM_NSUP, AS_RW, "nsup delete got timeout cb");
-
 	if (! rw->from.any) {
 		return; // lost race against dup-res or repl-write callback
 	}
@@ -406,12 +434,14 @@ delete_timeout_cb(rw_request* rw)
 
 	switch (rw->origin) {
 	case FROM_CLIENT:
-		as_msg_send_reply(rw->from.proto_fd_h, AS_PROTO_RESULT_FAIL_TIMEOUT, 0,
-				0, NULL, NULL, 0, rw->rsv.ns, rw_request_trid(rw));
-		client_delete_update_stats(rw->rsv.ns, AS_PROTO_RESULT_FAIL_TIMEOUT,
+		as_msg_send_reply(rw->from.proto_fd_h, AS_ERR_TIMEOUT, 0, 0, NULL, NULL,
+				0, rw->rsv.ns, rw_request_trid(rw));
+		client_delete_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT,
 				as_msg_is_xdr(&rw->msgp->msg));
 		break;
 	case FROM_PROXY:
+		from_proxy_delete_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT,
+				as_msg_is_xdr(&rw->msgp->msg));
 		break;
 	default:
 		cf_crash(AS_RW, "unexpected transaction origin %u", rw->origin);
@@ -438,7 +468,7 @@ drop_master(as_transaction* tr, as_index_ref* r_ref, rw_request* rw)
 	if (! generation_check(r, m, ns)) {
 		as_record_done(r_ref, ns);
 		cf_atomic64_incr(&ns->n_fail_generation);
-		tr->result_code = AS_PROTO_RESULT_FAIL_GENERATION;
+		tr->result_code = AS_ERR_GENERATION;
 		return TRANS_DONE_ERROR;
 	}
 
@@ -454,7 +484,7 @@ drop_master(as_transaction* tr, as_index_ref* r_ref, rw_request* rw)
 				! check_msg_key(m, &rd)) {
 			as_storage_record_close(&rd);
 			as_record_done(r_ref, ns);
-			tr->result_code = AS_PROTO_RESULT_FAIL_KEY_MISMATCH;
+			tr->result_code = AS_ERR_KEY_MISMATCH;
 			return TRANS_DONE_ERROR;
 		}
 
@@ -477,8 +507,7 @@ drop_master(as_transaction* tr, as_index_ref* r_ref, rw_request* rw)
 	as_index_delete(tree, &tr->keyd);
 	as_record_done(r_ref, ns);
 
-	if (xdr_must_ship_delete(ns, as_transaction_is_nsup_delete(tr),
-			as_msg_is_xdr(m))) {
+	if (xdr_must_ship_delete(ns, as_msg_is_xdr(m))) {
 		xdr_write(ns, &tr->keyd, 0, 0, XDR_OP_TYPE_DROP, set_id, NULL);
 	}
 

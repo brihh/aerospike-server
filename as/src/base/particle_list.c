@@ -204,6 +204,11 @@ typedef struct {
 	bool error;
 } list_order_index_sort_userdata;
 
+typedef struct {
+	offset_index *offidx;
+	uint8_t mem_temp[];
+} __attribute__ ((__packed__)) list_vla;
+
 #define define_packed_list_op(__name, __list_p) \
 	packed_list_op __name; \
 	packed_list_op_init(&__name, __list_p)
@@ -212,14 +217,12 @@ typedef struct {
 	(offset_index *)(list_is_ordered(__list_p) ? &(__list_p)->offidx : &(__list_p)->full_offidx)
 
 #define vla_list_full_offidx_if_invalid(__name, __list_p) \
-	union { \
-		offset_index *offidx; \
-		uint8_t mem_temp[sizeof(offset_index *) + (offset_index_is_valid(list_full_offidx_p(__list_p)) ? 0 : offset_index_size(list_full_offidx_p(__list_p)))]; \
-	} __name; \
-	__name.offidx = list_full_offidx_p(__list_p); \
-	if (! __name.offidx->_.ptr) { \
-		__name.offidx->_.ptr = __name.mem_temp + sizeof(offset_index *); \
-		offset_index_set_filled(__name.offidx, 1); \
+	uint8_t __name ## __vlatemp[sizeof(offset_index *) + (offset_index_is_valid(list_full_offidx_p(__list_p)) ? 0 : offset_index_size(list_full_offidx_p(__list_p)))]; \
+	list_vla *__name = (list_vla *)__name ## __vlatemp; \
+	__name->offidx = list_full_offidx_p(__list_p); \
+	if (! offset_index_is_valid(__name->offidx)) { \
+		__name->offidx->_.ptr = __name->mem_temp; \
+		offset_index_set_filled(__name->offidx, 1); \
 	}
 
 #define define_packed_list_particle(__name, __particle, __ret) \
@@ -312,7 +315,7 @@ static void list_offset_index_rm_mask_cpy(offset_index *dst, const offset_index 
 
 // list_full_offset_index
 static inline void list_full_offset_index_init(offset_index *offidx, uint8_t *idx_mem_ptr, uint32_t ele_count, const uint8_t *contents, uint32_t content_sz);
-static bool list_full_offset_index_fill_to(offset_index *offidx, uint32_t index);
+static bool list_full_offset_index_fill_to(offset_index *offidx, uint32_t index, bool check_storage);
 
 // list_order_index
 static int list_order_index_sort_cmp_fn(const void *x, const void *y, void *p);
@@ -362,7 +365,7 @@ list_concat_size_from_wire(as_particle_type wire_type,
 		const uint8_t *wire_value, uint32_t value_size, as_particle **pp)
 {
 	cf_warning(AS_PARTICLE, "concat size for list");
-	return -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+	return -AS_ERR_INCOMPATIBLE_TYPE;
 }
 
 int
@@ -370,7 +373,7 @@ list_append_from_wire(as_particle_type wire_type, const uint8_t *wire_value,
 		uint32_t value_size, as_particle **pp)
 {
 	cf_warning(AS_PARTICLE, "append to list");
-	return -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+	return -AS_ERR_INCOMPATIBLE_TYPE;
 }
 
 int
@@ -378,7 +381,7 @@ list_prepend_from_wire(as_particle_type wire_type, const uint8_t *wire_value,
 		uint32_t value_size, as_particle **pp)
 {
 	cf_warning(AS_PARTICLE, "prepend to list");
-	return -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+	return -AS_ERR_INCOMPATIBLE_TYPE;
 }
 
 int
@@ -386,7 +389,7 @@ list_incr_from_wire(as_particle_type wire_type, const uint8_t *wire_value,
 		uint32_t value_size, as_particle **pp)
 {
 	cf_warning(AS_PARTICLE, "increment of list");
-	return -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+	return -AS_ERR_INCOMPATIBLE_TYPE;
 }
 
 int32_t
@@ -397,7 +400,17 @@ list_size_from_wire(const uint8_t *wire_value, uint32_t value_size)
 
 	if (! packed_list_init(&list, wire_value, value_size)) {
 		cf_warning(AS_PARTICLE, "list_size_from_wire() invalid packed list");
-		return -AS_PROTO_RESULT_FAIL_UNKNOWN;
+		return -AS_ERR_UNKNOWN;
+	}
+
+	as_unpacker pk = {
+			.buffer = list.contents,
+			.length = list.content_sz
+	};
+
+	if (cdt_get_storage_list_sz(&pk, list.ele_count) != list.content_sz) {
+		cf_warning(AS_PARTICLE, "list_size_from_wire() invalid packed list: ele_count %u offset %u content_sz %u", list.ele_count, pk.offset, list.content_sz);
+		return -AS_ERR_PARAMETER;
 	}
 
 	return (int32_t)(sizeof(list_mem) + packed_list_mem_sz(&list, true, NULL));
@@ -411,17 +424,15 @@ list_from_wire(as_particle_type wire_type, const uint8_t *wire_value,
 	// It works for data-not-in-memory but we'll incur a memcpy that could be
 	// eliminated.
 	packed_list list;
+	bool is_valid = packed_list_init(&list, wire_value, value_size);
 
-	if (! packed_list_init(&list, wire_value, value_size)) {
-		cf_warning(AS_PARTICLE, "list_from_wire() invalid packed list");
-		return -AS_PROTO_RESULT_FAIL_UNKNOWN;
-	}
+	cf_assert(is_valid, AS_PARTICLE, "list_from_wire() invalid packed list");
 
 	list_mem *p_list_mem = packed_list_pack_mem(&list, (list_mem *)*pp);
 
 	p_list_mem->type = wire_type;
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 int
@@ -430,7 +441,7 @@ list_compare_from_wire(const as_particle *p, as_particle_type wire_type,
 {
 	// TODO
 	cf_warning(AS_PARTICLE, "list_compare_from_wire() not implemented");
-	return -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+	return -AS_ERR_INCOMPATIBLE_TYPE;
 }
 
 uint32_t
@@ -738,10 +749,10 @@ static inline int
 mod_flags_return_exists(uint64_t flags)
 {
 	if (mod_flags_is_no_fail(flags)) {
-		return AS_PROTO_RESULT_OK;
+		return AS_OK;
 	}
 
-	return -AS_PROTO_RESULT_FAIL_ELEMENT_EXISTS;
+	return -AS_ERR_ELEMENT_EXISTS;
 }
 
 static inline uint8_t
@@ -1067,7 +1078,7 @@ packed_list_find_idx_offset(const packed_list *list, uint32_t index)
 		if (offset_index_is_valid(&list->offidx)) {
 			offset_index *offidx = (offset_index *)&list->offidx;
 
-			if (! list_full_offset_index_fill_to(offidx, index)) {
+			if (! list_full_offset_index_fill_to(offidx, index, false)) {
 				return 0;
 			}
 
@@ -1077,7 +1088,7 @@ packed_list_find_idx_offset(const packed_list *list, uint32_t index)
 		define_offset_index(offidx, list->contents, list->content_sz,
 				list->ele_count);
 
-		if (! list_full_offset_index_fill_to(&offidx, index)) {
+		if (! list_full_offset_index_fill_to(&offidx, index, false)) {
 			return 0;
 		}
 
@@ -1506,7 +1517,7 @@ packed_list_remove_by_idx(const packed_list *list, as_bin *b,
 
 	if (! packed_list_op_remove(&op, rm_idx, 1)) {
 		cf_warning(AS_PARTICLE, "packed_list_remove_by_idx() as_packed_list_remove failed");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (op.new_ele_count == 0) {
@@ -1523,7 +1534,7 @@ packed_list_remove_by_idx(const packed_list *list, as_bin *b,
 
 	*rm_sz = list->content_sz - op.new_content_sz;
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -1549,7 +1560,7 @@ packed_list_remove_by_mask(const packed_list *list, as_bin *b,
 				rm_count);
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 // Assumes index/count(non-zero) is surrounded by other elements.
@@ -1568,7 +1579,7 @@ packed_list_trim(const packed_list *list, as_bin *b, rollback_alloc *alloc_buf,
 
 	if ((offset0 == 0 && index != 0) || offset1 == 0) {
 		cf_warning(AS_PARTICLE, "packed_list_trim() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (b) {
@@ -1618,7 +1629,7 @@ packed_list_trim(const packed_list *list, as_bin *b, rollback_alloc *alloc_buf,
 		if (! packed_list_builder_add_ranks_by_range(list, &builder, &pk, index,
 				result->type == RESULT_TYPE_REVRANK)) {
 			cf_warning(AS_PARTICLE, "packed_list_trim() invalid list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		pk.offset = offset1;
@@ -1626,7 +1637,7 @@ packed_list_trim(const packed_list *list, as_bin *b, rollback_alloc *alloc_buf,
 		if (! packed_list_builder_add_ranks_by_range(list, &builder, &pk,
 				rm_count - index, result->type == RESULT_TYPE_REVRANK)) {
 			cf_warning(AS_PARTICLE, "packed_list_trim() invalid list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		cdt_container_builder_set_result(&builder, result);
@@ -1654,10 +1665,10 @@ packed_list_trim(const packed_list *list, as_bin *b, rollback_alloc *alloc_buf,
 	}
 	default:
 		cf_warning(AS_PARTICLE, "packed_list_trim() result_type %d not supported", result->type);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -1671,19 +1682,19 @@ packed_list_get_remove_by_index_range(const packed_list *list, as_bin *b,
 	if (! calc_index_count(index, count, list->ele_count, &uindex, &count32,
 			result->is_multi)) {
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_index_range() index %ld out of bounds for ele_count %u", index, list->ele_count);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (result_data_is_inverted(result)) {
 		if (! result->is_multi) {
 			cf_warning(AS_PARTICLE, "packed_list_get_remove_by_index_range() INVERTED flag not supported for single result ops");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		if (result_data_is_return_index_range(result) ||
 				result_data_is_return_rank_range(result)) {
 			cf_warning(AS_PARTICLE, "packed_list_get_remove_by_index_range() result_type %d not supported with INVERTED flag", result->type);
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		result->flags &= ~AS_CDT_OP_FLAG_INVERTED;
@@ -1711,17 +1722,17 @@ packed_list_get_remove_by_index_range(const packed_list *list, as_bin *b,
 
 	if (count32 == 0) {
 		if (! list_result_data_set_not_found(result, uindex)) {
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
-		return AS_PROTO_RESULT_OK;
+		return AS_OK;
 	}
 
 	define_packed_list_op(op, list);
 
 	if (! packed_list_op_remove(&op, uindex, count32)) {
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_index_range() as_packed_list_remove failed");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (b) {
@@ -1769,7 +1780,7 @@ packed_list_get_remove_by_index_range(const packed_list *list, as_bin *b,
 				if (! packed_list_find_rank_range_by_value_interval_unordered(
 						list, &value, &value, &rank, &rcount, NULL, false,
 						false)) {
-					return -AS_PROTO_RESULT_FAIL_PARAMETER;
+					return -AS_ERR_PARAMETER;
 				}
 			}
 
@@ -1796,7 +1807,7 @@ packed_list_get_remove_by_index_range(const packed_list *list, as_bin *b,
 		else if (! packed_list_builder_add_ranks_by_range(list, &builder, &pk,
 				rm_count, result->type == RESULT_TYPE_REVRANK)) {
 			cf_warning(AS_PARTICLE, "packed_list_get_remove_by_index_range() invalid list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		cdt_container_builder_set_result(&builder, result);
@@ -1817,7 +1828,7 @@ packed_list_get_remove_by_index_range(const packed_list *list, as_bin *b,
 							result_count, result_ptr, result_sz);
 
 			if (! result->result->particle) {
-				return -AS_PROTO_RESULT_FAIL_UNKNOWN;
+				return -AS_ERR_UNKNOWN;
 			}
 
 			as_bin_state_set_from_type(result->result, AS_PARTICLE_TYPE_LIST);
@@ -1847,7 +1858,7 @@ packed_list_get_remove_by_index_range(const packed_list *list, as_bin *b,
 		// no break
 	default:
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_index_range() result_type %d not supported", result->type);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 #ifdef LIST_DEBUG_VERIFY
@@ -1856,7 +1867,7 @@ packed_list_get_remove_by_index_range(const packed_list *list, as_bin *b,
 	}
 #endif
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 // value_end == NULL means looking for: [value_start, largest possible value].
@@ -1870,7 +1881,7 @@ packed_list_get_remove_by_value_interval(const packed_list *list, as_bin *b,
 
 	if (inverted && ! result->is_multi) {
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_value_interval() INVERTED flag not supported for single result ops");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint32_t rank;
@@ -1881,15 +1892,15 @@ packed_list_get_remove_by_value_interval(const packed_list *list, as_bin *b,
 
 		if (! packed_list_find_rank_range_by_value_interval_ordered(list,
 				value_start, value_end, &rank, &count, result->is_multi)) {
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		if (count == 0 && ! result->is_multi) {
 			if (! list_result_data_set_not_found(result, 0)) {
-				return -AS_PROTO_RESULT_FAIL_PARAMETER;
+				return -AS_ERR_PARAMETER;
 			}
 
-			return AS_PROTO_RESULT_OK;
+			return AS_OK;
 		}
 
 		return packed_list_get_remove_by_index_range(list, b, alloc_buf,
@@ -1902,7 +1913,7 @@ packed_list_get_remove_by_value_interval(const packed_list *list, as_bin *b,
 	if (! packed_list_find_rank_range_by_value_interval_unordered(list,
 			value_start, value_end, &rank, &rm_count, rm_mask, inverted,
 			result->is_multi)) {
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint32_t rm_sz = 0;
@@ -1924,7 +1935,7 @@ packed_list_get_remove_by_value_interval(const packed_list *list, as_bin *b,
 						&rm_sz);
 			}
 
-			if (ret != AS_PROTO_RESULT_OK) {
+			if (ret != AS_OK) {
 				return ret;
 			}
 		}
@@ -1965,7 +1976,7 @@ packed_list_get_remove_by_value_interval(const packed_list *list, as_bin *b,
 			define_order_index2(rm_idx, list->ele_count, 1);
 
 			order_index_set(&rm_idx, 0, rm_mask[0]);
-			list_result_data_set_values_by_ordidx(result, &rm_idx, u.offidx,
+			list_result_data_set_values_by_ordidx(result, &rm_idx, u->offidx,
 					rm_count, rm_sz);
 		}
 		break;
@@ -1973,10 +1984,10 @@ packed_list_get_remove_by_value_interval(const packed_list *list, as_bin *b,
 	case RESULT_TYPE_REVINDEX_RANGE:
 	default:
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_value_interval() result_type %d not supported", result->type);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -1988,7 +1999,7 @@ packed_list_get_remove_by_rank_range(const packed_list *list, as_bin *b,
 
 	if (inverted && ! result->is_multi) {
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_rank_range() INVERTED flag not supported for single result ops");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (list_is_ordered(list)) {
@@ -2003,14 +2014,14 @@ packed_list_get_remove_by_rank_range(const packed_list *list, as_bin *b,
 	if (! calc_index_count(rank, count, list->ele_count, &urank, &count32,
 			result->is_multi)) {
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_rank_range() rank %u out of bounds for ele_count %u", urank, list->ele_count);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	vla_list_full_offidx_if_invalid(full, list);
 
-	if (! list_full_offset_index_fill_all(full.offidx)) {
+	if (! list_full_offset_index_fill_all(full->offidx, false)) {
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_rank_range() invalid packed list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	define_build_order_heap_by_range(heap, urank, count32, list->ele_count,
@@ -2018,19 +2029,19 @@ packed_list_get_remove_by_rank_range(const packed_list *list, as_bin *b,
 
 	if (! success) {
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_rank_range() invalid packed list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint32_t rm_count = inverted ? list->ele_count - count32 : count32;
 
 	if (rm_count == 0) {
 		if (! list_result_data_set_not_found(result, urank)) {
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		packed_list_partial_offidx_update(list);
 
-		return AS_PROTO_RESULT_OK;
+		return AS_OK;
 	}
 
 	define_cdt_idx_mask(rm_mask, list->ele_count);
@@ -2042,12 +2053,12 @@ packed_list_get_remove_by_rank_range(const packed_list *list, as_bin *b,
 	if (inverted) {
 		if (result_data_is_return_rank_range(result)) {
 			cf_warning(AS_PARTICLE, "packed_list_get_remove_by_rank_range() result_type %d not supported with INVERTED flag", result->type);
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		if (! result->is_multi) {
 			cf_warning(AS_PARTICLE, "packed_list_get_remove_by_rank_range() singe result type %d not supported with INVERTED flag", result->type);
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 	}
 	else {
@@ -2060,7 +2071,7 @@ packed_list_get_remove_by_rank_range(const packed_list *list, as_bin *b,
 		int ret = packed_list_remove_by_mask(list, b, alloc_buf, rm_mask,
 				rm_count, &rm_sz);
 
-		if (ret != AS_PROTO_RESULT_OK) {
+		if (ret != AS_OK) {
 			return ret;
 		}
 	}
@@ -2089,17 +2100,17 @@ packed_list_get_remove_by_rank_range(const packed_list *list, as_bin *b,
 		else if (! list_result_data_set_values_by_ordidx(result, &ret_idx,
 				&list->full_offidx, rm_count, rm_sz)) {
 			cf_warning(AS_PARTICLE, "packed_list_get_remove_by_rank_range() invalid packed list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 		break;
 	case RESULT_TYPE_INDEX_RANGE:
 	case RESULT_TYPE_REVINDEX_RANGE:
 	default:
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_by_rank_range() result_type %d not supported", result->type);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -2109,9 +2120,9 @@ packed_list_get_remove_all_by_value_list_ordered(const packed_list *list,
 {
 	cf_assert(result->is_multi, AS_PARTICLE, "not supported");
 
-	if (! list_full_offset_index_fill_all(list_full_offidx_p(list))) {
+	if (! list_full_offset_index_fill_all(list_full_offidx_p(list), false)) {
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_all_by_value_list_ordered() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	define_order_index2(rm_rc, list->ele_count, 2 * items_count);
@@ -2123,7 +2134,7 @@ packed_list_get_remove_all_by_value_list_ordered(const packed_list *list,
 
 		if (sz <= 0) {
 			cf_warning(AS_PARTICLE, "packed_list_get_remove_all_by_value_list_ordered() invalid list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		value.sz = (uint32_t)sz;
@@ -2134,7 +2145,7 @@ packed_list_get_remove_all_by_value_list_ordered(const packed_list *list,
 		if (! packed_list_find_rank_range_by_value_interval_ordered(list,
 				&value, &value, &rank, &count, true)) {
 			cf_warning(AS_PARTICLE, "packed_list_get_remove_all_by_value_list_ordered() invalid list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		order_index_set(&rm_rc, 2 * i, rank);
@@ -2162,7 +2173,7 @@ packed_list_get_remove_all_by_value_list_ordered(const packed_list *list,
 			int ret = packed_list_remove_by_mask(list, b, alloc_buf, rm_mask,
 					rm_count, &rm_sz);
 
-			if (ret != AS_PROTO_RESULT_OK) {
+			if (ret != AS_OK) {
 				return ret;
 			}
 		}
@@ -2205,7 +2216,7 @@ packed_list_get_remove_all_by_value_list_ordered(const packed_list *list,
 	}
 	default:
 		cf_warning(AS_PARTICLE, "packed_list_get_remove_all_by_value_list_ordered() result_type %d not supported", result->type);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 #ifdef LIST_DEBUG_VERIFY
@@ -2216,7 +2227,7 @@ packed_list_get_remove_all_by_value_list_ordered(const packed_list *list,
 	}
 #endif
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -2227,14 +2238,14 @@ packed_list_get_remove_all_by_value_list(const packed_list *list, as_bin *b,
 	if (result_data_is_return_rank_range(result) ||
 			result_data_is_return_index_range(result)) {
 		cf_warning(AS_PARTICLE, "packed_list_op_get_remove_all_by_value_list() result_type %d not supported", result->type);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	as_unpacker items_pk;
 	uint32_t items_count;
 
 	if (! list_param_parse(value_list, &items_pk, &items_count)) {
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	bool inverted = result_data_is_inverted(result);
@@ -2243,10 +2254,10 @@ packed_list_get_remove_all_by_value_list(const packed_list *list, as_bin *b,
 		if (! inverted) {
 			if (! list_result_data_set_not_found(result, 0)) {
 				cf_warning(AS_PARTICLE, "packed_list_get_remove_all_by_value_list() invalid result type %d", result->type);
-				return -AS_PROTO_RESULT_FAIL_PARAMETER;
+				return -AS_ERR_PARAMETER;
 			}
 
-			return AS_PROTO_RESULT_OK;
+			return AS_OK;
 		}
 
 		result->flags &= ~AS_CDT_OP_FLAG_INVERTED;
@@ -2268,10 +2279,10 @@ packed_list_get_remove_all_by_value_list(const packed_list *list, as_bin *b,
 	define_cdt_idx_mask(rm_mask, list->ele_count);
 	cond_vla_order_index2(rc, list->ele_count, items_count * 2, is_ret_rank);
 
-	if (! offset_index_find_items(full.offidx,
+	if (! offset_index_find_items(full->offidx,
 			CDT_FIND_ITEMS_IDXS_FOR_LIST_VALUE, &items_pk, &value_list_ordidx,
 			inverted, rm_mask, &rm_count, is_ret_rank ? &rc.ordidx : NULL)) {
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint32_t rm_sz = 0;
@@ -2284,7 +2295,7 @@ packed_list_get_remove_all_by_value_list(const packed_list *list, as_bin *b,
 			int ret = packed_list_remove_by_mask(list, b, alloc_buf, rm_mask,
 					rm_count, &rm_sz);
 
-			if (ret != AS_PROTO_RESULT_OK) {
+			if (ret != AS_OK) {
 				return ret;
 			}
 		}
@@ -2313,16 +2324,16 @@ packed_list_get_remove_all_by_value_list(const packed_list *list, as_bin *b,
 		as_bin_set_int(result->result, rm_count);
 		break;
 	case RESULT_TYPE_VALUE: {
-		list_result_data_set_values_by_mask(result, rm_mask, full.offidx,
+		list_result_data_set_values_by_mask(result, rm_mask, full->offidx,
 				rm_count, rm_sz);
 		break;
 	}
 	default:
 		cf_warning(AS_PARTICLE, "packed_list_op_get_remove_all_by_value_list() result_type %d not supported", result->type);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -2338,7 +2349,7 @@ packed_list_get_remove_by_rel_rank_range(const packed_list *list, as_bin *b,
 
 		if (! packed_list_find_rank_range_by_value_interval_ordered(list,
 				value, value, &rel_rank, &temp, result->is_multi)) {
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		calc_rel_index_count(rank, count, rel_rank, &rank, &count);
@@ -2353,7 +2364,7 @@ packed_list_get_remove_by_rel_rank_range(const packed_list *list, as_bin *b,
 	if (! packed_list_find_rank_range_by_value_interval_unordered(list,
 			value, value, &rel_rank, &temp, NULL,
 			result_data_is_inverted(result), result->is_multi)) {
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	calc_rel_index_count(rank, count, rel_rank, &rank, &count);
@@ -2376,35 +2387,41 @@ packed_list_insert(const packed_list *list, as_bin *b,
 
 		if (payload_count < 0) {
 			cf_warning(AS_PARTICLE, "packed_list_insert() invalid payload, expected a list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		if (payload_count == 0) {
 			result_data_set_int(result, list->ele_count);
-			return AS_PROTO_RESULT_OK;
+			return AS_OK;
 		}
 
 		param_count = (uint32_t)payload_count;
-		payload_hdr_sz = as_pack_list_header_get_size((uint32_t)payload_count);
+		payload_hdr_sz = as_pack_list_header_get_size(param_count);
 
 		if (payload_hdr_sz > payload->sz) {
 			cf_warning(AS_PARTICLE, "packed_list_insert() invalid list header: payload->size=%d", payload->sz);
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
+	}
+
+	if (! cdt_check_storage_list_contents(payload->ptr + payload_hdr_sz,
+			payload->sz - payload_hdr_sz, param_count)) {
+		cf_warning(AS_PARTICLE, "packed_list_insert() invalid payload");
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (index > INT32_MAX || (index = calc_index(index, list->ele_count)) < 0) {
 		cf_warning(AS_PARTICLE, "packed_list_insert() index %ld out of bounds for ele_count %d", index > 0 ? index : index - list->ele_count, list->ele_count);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (mod_flags_is_bounded(mod_flags) && (uint32_t)index > list->ele_count) {
 		if (mod_flags_is_no_fail(mod_flags)) {
 			result_data_set_int(result, list->ele_count);
-			return AS_PROTO_RESULT_OK; // no-op
+			return AS_OK; // no-op
 		}
 
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint32_t rm_sz = 0;
@@ -2428,14 +2445,14 @@ packed_list_insert(const packed_list *list, as_bin *b,
 
 				if (sz <= 0) {
 					cf_warning(AS_PARTICLE, "packed_list_insert() invalid parameters");
-					return -AS_PROTO_RESULT_FAIL_PARAMETER;
+					return -AS_ERR_PARAMETER;
 				}
 
 				val.sz = (uint32_t)sz;
 
 				if (! packed_list_find_rank_range_by_value_interval_unordered(
 						list, &val, &val, &rank, &count, NULL, false, false)) {
-					return -AS_PROTO_RESULT_FAIL_PARAMETER;
+					return -AS_ERR_PARAMETER;
 				}
 
 				if (count == 0) {
@@ -2456,12 +2473,12 @@ packed_list_insert(const packed_list *list, as_bin *b,
 
 						if (cmp == MSGPACK_COMPARE_EQUAL) {
 							if (! mod_flags_is_no_fail(mod_flags)) {
-								return -AS_PROTO_RESULT_FAIL_PARAMETER;
+								return -AS_ERR_PARAMETER;
 							}
 
 							if (! mod_flags_is_do_partial(mod_flags)) {
 								as_bin_set_int(result->result, list->ele_count);
-								return AS_PROTO_RESULT_OK;
+								return AS_OK;
 							}
 
 							rm_sz += val.sz;
@@ -2498,7 +2515,7 @@ packed_list_insert(const packed_list *list, as_bin *b,
 
 			if (! packed_list_find_rank_range_by_value_interval_unordered(list,
 					payload, payload, &rank, &count, NULL, false, false)) {
-				return -AS_PROTO_RESULT_FAIL_PARAMETER;
+				return -AS_ERR_PARAMETER;
 			}
 
 			if (count != 0) {
@@ -2515,7 +2532,7 @@ packed_list_insert(const packed_list *list, as_bin *b,
 
 	if (! packed_list_op_insert(&op, uindex, add_count, insert_sz)) {
 		cf_warning(AS_PARTICLE, "packed_list_insert() packed_list_op_insert failed");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint8_t *ptr = list_setup_bin(b, alloc_buf, list->ext_flags,
@@ -2565,7 +2582,7 @@ packed_list_insert(const packed_list *list, as_bin *b,
 	}
 #endif
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -2581,7 +2598,7 @@ packed_list_add_ordered(const packed_list *list, as_bin *b,
 
 	if (! packed_list_find_by_value_ordered(list, payload, &find)) {
 		cf_warning(AS_PARTICLE, "packed_list_add_ordered() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (find.found && mod_flags_is_unique(mod_flags)) {
@@ -2602,12 +2619,12 @@ packed_list_add_items_ordered(const packed_list *list, as_bin *b,
 
 	if (add_count < 0) {
 		cf_warning(AS_PARTICLE, "packed_list_add_items_ordered() invalid payload, expected a list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (add_count == 0) {
 		result_data_set_int(result, list->ele_count);
-		return AS_PROTO_RESULT_OK; // no-op
+		return AS_OK; // no-op
 	}
 
 	uint32_t val_count = (uint32_t)add_count;
@@ -2615,7 +2632,7 @@ packed_list_add_items_ordered(const packed_list *list, as_bin *b,
 
 	if (hdr_sz > items->sz) {
 		cf_warning(AS_PARTICLE, "packed_list_add_items_ordered() invalid list header: payload->size=%d", items->sz);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	// Sort items to add.
@@ -2623,11 +2640,11 @@ packed_list_add_items_ordered(const packed_list *list, as_bin *b,
 	define_offset_index(val_off, items->ptr + hdr_sz, items->sz - hdr_sz,
 			val_count);
 
-	if (! list_full_offset_index_fill_all(&val_off) ||
+	if (! list_full_offset_index_fill_all(&val_off, true) ||
 			! list_order_index_sort(&val_ord, &val_off,
 					AS_CDT_SORT_ASCENDING)) {
 		cf_warning(AS_PARTICLE, "packed_list_add_items_ordered() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	bool unique = mod_flags_is_unique(mod_flags);
@@ -2641,12 +2658,12 @@ packed_list_add_items_ordered(const packed_list *list, as_bin *b,
 
 		if (rm_count != 0) {
 			if (! mod_flags_is_no_fail(mod_flags)) {
-				return -AS_PROTO_RESULT_FAIL_PARAMETER;
+				return -AS_ERR_PARAMETER;
 			}
 
 			if (! mod_flags_is_do_partial(mod_flags)) {
 				as_bin_set_int(result->result, list->ele_count);
-				return AS_PROTO_RESULT_OK;
+				return AS_OK;
 			}
 		}
 	}
@@ -2677,7 +2694,7 @@ packed_list_add_items_ordered(const packed_list *list, as_bin *b,
 
 		if (! packed_list_find_by_value_ordered(list, &value, &find)) {
 			cf_warning(AS_PARTICLE, "packed_list_add_items_ordered() invalid list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		if (unique && find.found) {
@@ -2696,9 +2713,9 @@ packed_list_add_items_ordered(const packed_list *list, as_bin *b,
 		}
 	}
 
-	if (! list_full_offset_index_fill_all(full.offidx)) {
+	if (! list_full_offset_index_fill_all(full->offidx, false)) {
 		cf_warning(AS_PARTICLE, "packed_list_add_items_ordered() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	// Construct new list.
@@ -2766,7 +2783,7 @@ packed_list_add_items_ordered(const packed_list *list, as_bin *b,
 	}
 #endif
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -2780,24 +2797,24 @@ packed_list_replace_ordered(const packed_list *list, as_bin *b,
 
 	if (! packed_list_find_rank_range_by_value_interval_ordered(list,
 			value, value, &rank, &count, false)) {
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	define_packed_list_op(op, list);
 
 	if (index > list->ele_count) {
 		cf_warning(AS_PARTICLE, "packed_list_replace_ordered() index %u > ele_count %u out of bounds not allowed for ORDERED lists", index, list->ele_count);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (! packed_list_op_remove(&op, index, 1)) {
 		cf_warning(AS_PARTICLE, "packed_list_replace_ordered() as_packed_list_remove failed");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (mod_flags_is_unique(mod_flags) && count != 0) {
 		if (rank == index) { // uniquely replacing element with same value
-			return AS_PROTO_RESULT_OK; // no-op
+			return AS_OK; // no-op
 		}
 
 		return mod_flags_return_exists(mod_flags);
@@ -2814,7 +2831,7 @@ packed_list_replace_ordered(const packed_list *list, as_bin *b,
 	uint8_t *ptr = list_setup_bin(b, alloc_buf, list->ext_flags,
 			op.new_content_sz, new_ele_count, (rank < index) ? rank : index,
 					&list->offidx, NULL);
-	uint32_t offset = offset_index_get_const(u.offidx, rank);
+	uint32_t offset = offset_index_get_const(u->offidx, rank);
 
 	if (rank <= index) {
 		uint32_t tail_sz = op.seg1_sz - offset;
@@ -2843,7 +2860,7 @@ packed_list_replace_ordered(const packed_list *list, as_bin *b,
 		memcpy(ptr, list->contents + offset, tail_sz);
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 //----------------------------------------------------------
@@ -3066,7 +3083,7 @@ list_set_flags(as_bin *b, rollback_alloc *alloc_buf, uint8_t set_flags,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_set_flags() invalid packed list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	bool reorder = false;
@@ -3074,7 +3091,7 @@ list_set_flags(as_bin *b, rollback_alloc *alloc_buf, uint8_t set_flags,
 
 	if (flags_is_ordered(set_flags)) {
 		if (was_ordered) {
-			return AS_PROTO_RESULT_OK; // no-op
+			return AS_OK; // no-op
 		}
 
 		if (list.ele_count > 1) {
@@ -3083,7 +3100,7 @@ list_set_flags(as_bin *b, rollback_alloc *alloc_buf, uint8_t set_flags,
 	}
 	else {
 		if (! was_ordered) {
-			return AS_PROTO_RESULT_OK; // no-op
+			return AS_OK; // no-op
 		}
 	}
 
@@ -3098,20 +3115,20 @@ list_set_flags(as_bin *b, rollback_alloc *alloc_buf, uint8_t set_flags,
 	else {
 		vla_list_full_offidx_if_invalid(full, &list);
 
-		if (! list_full_offset_index_fill_all(full.offidx)) {
+		if (! list_full_offset_index_fill_all(full->offidx, false)) {
 			cf_warning(AS_PARTICLE, "list_set_flags() invalid list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		define_order_index(ordidx, list.ele_count);
 
-		if (! list_order_index_sort(&ordidx, full.offidx,
+		if (! list_order_index_sort(&ordidx, full->offidx,
 				AS_CDT_SORT_ASCENDING)) {
 			cf_warning(AS_PARTICLE, "list_set_flags() invalid list");
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
-		list_order_index_pack(&ordidx, full.offidx, ptr, &new_offidx);
+		list_order_index_pack(&ordidx, full->offidx, ptr, &new_offidx);
 	}
 
 #ifdef LIST_DEBUG_VERIFY
@@ -3122,7 +3139,7 @@ list_set_flags(as_bin *b, rollback_alloc *alloc_buf, uint8_t set_flags,
 	}
 #endif
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -3133,7 +3150,7 @@ list_append(as_bin *b, rollback_alloc *alloc_buf, const cdt_payload *payload,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_append() invalid packed list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (list_is_ordered(&list)) {
@@ -3159,12 +3176,12 @@ list_insert(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_insert() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (list_is_ordered(&list)) {
 		cf_warning(AS_PARTICLE, "list_insert() invalid op on ORDERED list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	return packed_list_insert(&list, b, alloc_buf, index, payload,
@@ -3179,12 +3196,12 @@ list_set(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_set() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (list_is_ordered(&list)) {
 		cf_warning(AS_PARTICLE, "list_set() invalid op on ORDERED list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint32_t ele_count = list.ele_count;
@@ -3196,7 +3213,7 @@ list_set(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 
 	if (index > UINT32_MAX || (index = calc_index(index, ele_count)) < 0) {
 		cf_warning(AS_PARTICLE, "list_set() index %ld out of bounds for ele_count %d", index > 0 ? index : index - ele_count, ele_count);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (mod_flags_is_unique(mod_flags)) {
@@ -3208,7 +3225,7 @@ list_set(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 		// 2 or more copies will result in an additional multi-find scan below.
 		if (! packed_list_find_rank_range_by_value_interval_unordered(&list,
 				value, value, &rank, &count, &idx, false, false)) {
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		if (count != 0) {
@@ -3219,7 +3236,7 @@ list_set(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 			// Need second scan since the dup found is at the index being set.
 			if (! packed_list_find_rank_range_by_value_interval_unordered(&list,
 					value, value, &rank, &count, NULL, false, true)) {
-				return -AS_PROTO_RESULT_FAIL_PARAMETER;
+				return -AS_ERR_PARAMETER;
 			}
 
 			if (count > 1) {
@@ -3233,7 +3250,7 @@ list_set(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 
 	if (! packed_list_op_remove(&op, uindex, 1)) {
 		cf_warning(AS_PARTICLE, "list_set() as_packed_list_remove failed");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	op.new_content_sz += value->sz;
@@ -3248,7 +3265,7 @@ list_set(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 
 	packed_list_op_write_seg2(&op, ptr);
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -3259,19 +3276,19 @@ list_increment(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_increment() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (index > INT32_MAX || (index = calc_index(index, list.ele_count)) < 0) {
 		cf_warning(AS_PARTICLE, "list_increment() index %ld out of bounds for ele_count %d", index > 0 ? index : index - list.ele_count, list.ele_count);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint32_t uindex = (uint32_t)index;
 	cdt_calc_delta calc_delta;
 
 	if (! cdt_calc_delta_init(&calc_delta, delta_value, false)) {
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (uindex < list.ele_count) {
@@ -3279,7 +3296,7 @@ list_increment(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 
 		if (uindex != 0 && offset == 0) {
 			cf_warning(AS_PARTICLE, "list_increment() unable to unpack element at %u", uindex);
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 
 		as_unpacker pk = {
@@ -3288,12 +3305,12 @@ list_increment(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 		};
 
 		if (! cdt_calc_delta_add(&calc_delta, &pk)) {
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 	}
 	else {
 		if (! cdt_calc_delta_add(&calc_delta, NULL)) {
-			return -AS_PROTO_RESULT_FAIL_PARAMETER;
+			return -AS_ERR_PARAMETER;
 		}
 	}
 
@@ -3317,18 +3334,18 @@ list_sort(as_bin *b, rollback_alloc *alloc_buf, as_cdt_sort_flags sort_flags)
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_sort() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	if (list.ele_count <= 1) {
-		return AS_PROTO_RESULT_OK;
+		return AS_OK;
 	}
 
 	vla_list_full_offidx_if_invalid(full, &list);
 
-	if (! list_full_offset_index_fill_all(full.offidx)) {
+	if (! list_full_offset_index_fill_all(full->offidx, false)) {
 		cf_warning(AS_PARTICLE, "list_sort() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	define_order_index(ordidx, list.ele_count);
@@ -3338,19 +3355,19 @@ list_sort(as_bin *b, rollback_alloc *alloc_buf, as_cdt_sort_flags sort_flags)
 			order_index_set(&ordidx, i, i);
 		}
 	}
-	else if (! list_order_index_sort(&ordidx, full.offidx, sort_flags)) {
+	else if (! list_order_index_sort(&ordidx, full->offidx, sort_flags)) {
 		cf_warning(AS_PARTICLE, "list_sort() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	uint32_t rm_count = 0;
 	uint32_t rm_sz = 0;
 
 	if ((sort_flags & AS_CDT_SORT_DROP_DUPLICATES) != 0 &&
-			! order_index_sorted_mark_dup_eles(&ordidx, full.offidx,
+			! order_index_sorted_mark_dup_eles(&ordidx, full->offidx,
 					&rm_count, &rm_sz)) {
 		cf_warning(AS_PARTICLE, "list_sort() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	offset_index new_offidx;
@@ -3358,11 +3375,11 @@ list_sort(as_bin *b, rollback_alloc *alloc_buf, as_cdt_sort_flags sort_flags)
 			list.content_sz - rm_sz, list.ele_count - rm_count, 0, &list.offidx,
 			&new_offidx);
 
-	ptr = list_order_index_pack(&ordidx, full.offidx, ptr, &new_offidx);
+	ptr = list_order_index_pack(&ordidx, full->offidx, ptr, &new_offidx);
 	cf_assert(ptr == ((list_mem *)b->particle)->data + ((list_mem *)b->particle)->sz, AS_PARTICLE,
 			"list_sort() pack mismatch ptr %p data %p sz %u [%p]", ptr, ((list_mem *)b->particle)->data, ((list_mem *)b->particle)->sz, ((list_mem *)b->particle)->data + ((list_mem *)b->particle)->sz);
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 static int
@@ -3373,7 +3390,7 @@ list_remove_by_index_range(as_bin *b, rollback_alloc *alloc_buf, int64_t index,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_remove_by_index_range() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	return packed_list_get_remove_by_index_range(&list, b, alloc_buf, index,
@@ -3389,7 +3406,7 @@ list_remove_by_value_interval(as_bin *b, rollback_alloc *alloc_buf,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_remove_by_value_interval() invalid packed list, ele_count=%d", list.ele_count);
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	return packed_list_get_remove_by_value_interval(&list, b, alloc_buf,
@@ -3404,7 +3421,7 @@ list_remove_by_rank_range(as_bin *b, rollback_alloc *alloc_buf, int64_t rank,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_remove_by_rank_range() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	return packed_list_get_remove_by_rank_range(&list, b, alloc_buf, rank,
@@ -3419,7 +3436,7 @@ list_remove_all_by_value_list(as_bin *b, rollback_alloc *alloc_buf,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_remove_all_by_value_list() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	return packed_list_get_remove_all_by_value_list(&list, b, alloc_buf,
@@ -3435,7 +3452,7 @@ list_remove_by_rel_rank_range(as_bin *b, rollback_alloc *alloc_buf,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "list_remove_by_rel_rank_range() invalid list");
-		return -AS_PROTO_RESULT_FAIL_PARAMETER;
+		return -AS_ERR_PARAMETER;
 	}
 
 	return packed_list_get_remove_by_rel_rank_range(&list, b, alloc_buf, value,
@@ -3543,14 +3560,14 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 
 	if (as_bin_inuse(b) && ! is_list_type(as_bin_get_particle_type(b))) {
 		cf_warning(AS_PARTICLE, "cdt_process_state_packed_list_modify_optype() invalid type %d", as_bin_get_particle_type(b));
-		cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+		cdt_udata->ret_code = -AS_ERR_INCOMPATIBLE_TYPE;
 		return false;
 	}
 
 	define_rollback_alloc(alloc_buf, cdt_udata->alloc_buf, 5, true);
 	// Results always on the heap.
 	define_rollback_alloc(alloc_result, NULL, 1, false);
-	int ret = AS_PROTO_RESULT_OK;
+	int ret = AS_OK;
 
 	cdt_result_data result = {
 			.result = cdt_udata->result,
@@ -3562,7 +3579,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t list_type;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &list_type)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3576,7 +3593,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t modify = AS_CDT_LIST_MODIFY_DEFAULT;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &value, &create_type, &modify)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3590,7 +3607,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t modify = AS_CDT_LIST_MODIFY_DEFAULT;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &items, &create_type, &modify)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3604,7 +3621,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t modify = AS_CDT_LIST_MODIFY_DEFAULT;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index, &value, &modify)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3618,7 +3635,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t modify = AS_CDT_LIST_MODIFY_DEFAULT;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index, &items, &modify)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3632,7 +3649,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t modify = AS_CDT_LIST_MODIFY_DEFAULT;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index, &value, &modify)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3649,7 +3666,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		int64_t index;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3668,7 +3685,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t count = UINT32_MAX;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index, &count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3686,7 +3703,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t count = UINT32_MAX;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index, &count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3705,7 +3722,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 
 		if (! packed_list_init_from_bin(&list, b)) {
 			cf_warning(AS_PARTICLE, "LIST_CLEAR: invalid list");
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3720,7 +3737,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index, &delta, &create,
 				&modify)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3730,14 +3747,14 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 	}
 	case AS_CDT_OP_LIST_SORT: {
 		if (! as_bin_inuse(b)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+			cdt_udata->ret_code = -AS_ERR_INCOMPATIBLE_TYPE;
 			return false;
 		}
 
 		uint64_t flags = 0;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &flags)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3753,7 +3770,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		int64_t index;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &index)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3771,7 +3788,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		cdt_payload value;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3790,7 +3807,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		int64_t rank;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &rank)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3807,7 +3824,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		cdt_payload items;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &items)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3825,7 +3842,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t count = UINT32_MAX;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &index, &count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3844,7 +3861,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value_start,
 				&value_end)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3863,7 +3880,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 		uint64_t count = UINT32_MAX;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &rank, &count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3883,7 +3900,7 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value, &rank,
 				&count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3894,11 +3911,11 @@ cdt_process_state_packed_list_modify_optype(cdt_process_state *state,
 	}
 	default:
 		cf_warning(AS_PARTICLE, "cdt_process_state_packed_list_modify_optype() invalid cdt op: %d", optype);
-		cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+		cdt_udata->ret_code = -AS_ERR_PARAMETER;
 		return false;
 	}
 
-	if (ret != AS_PROTO_RESULT_OK) {
+	if (ret != AS_OK) {
 		cf_warning(AS_PARTICLE, "%s: failed", cdt_process_state_get_op_name(state));
 		cdt_udata->ret_code = ret;
 		rollback_alloc_rollback(alloc_result);
@@ -3925,7 +3942,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 	as_cdt_optype optype = state->type;
 
 	if (! is_list_type(as_bin_get_particle_type(b))) {
-		cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+		cdt_udata->ret_code = -AS_ERR_INCOMPATIBLE_TYPE;
 		return false;
 	}
 
@@ -3933,13 +3950,13 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 
 	if (! packed_list_init_from_bin(&list, b)) {
 		cf_warning(AS_PARTICLE, "%s: invalid list", cdt_process_state_get_op_name(state));
-		cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_INCOMPATIBLE_TYPE;
+		cdt_udata->ret_code = -AS_ERR_INCOMPATIBLE_TYPE;
 		return false;
 	}
 
 	// Just one entry needed for results bin.
 	define_rollback_alloc(alloc_result, NULL, 1, false);
-	int ret = AS_PROTO_RESULT_OK;
+	int ret = AS_OK;
 
 	cdt_result_data result = {
 			.result = cdt_udata->result,
@@ -3951,7 +3968,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 		int64_t index;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3965,7 +3982,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 		uint64_t count = UINT32_MAX;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &index, &count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3983,7 +4000,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 		int64_t index;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &index)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -3998,7 +4015,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 		cdt_payload value;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -4013,7 +4030,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 		int64_t rank;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &rank)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -4027,7 +4044,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 		cdt_payload value_list;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value_list)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -4042,7 +4059,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 		uint64_t count = UINT32_MAX;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &index, &count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -4058,7 +4075,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value_start,
 				&value_end)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -4073,7 +4090,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 		uint64_t count = UINT32_MAX;
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &rank, &count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -4090,7 +4107,7 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 
 		if (! CDT_OP_TABLE_GET_PARAMS(state, &result_type, &value, &rank,
 				&count)) {
-			cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+			cdt_udata->ret_code = -AS_ERR_PARAMETER;
 			return false;
 		}
 
@@ -4101,11 +4118,11 @@ cdt_process_state_packed_list_read_optype(cdt_process_state *state,
 	}
 	default:
 		cf_warning(AS_PARTICLE, "cdt_process_state_packed_list_read_optype() invalid cdt op: %d", optype);
-		cdt_udata->ret_code = -AS_PROTO_RESULT_FAIL_PARAMETER;
+		cdt_udata->ret_code = -AS_ERR_PARAMETER;
 		return false;
 	}
 
-	if (ret != AS_PROTO_RESULT_OK) {
+	if (ret != AS_OK) {
 		cf_warning(AS_PARTICLE, "%s: failed", cdt_process_state_get_op_name(state));
 		cdt_udata->ret_code = ret;
 		rollback_alloc_rollback(alloc_result);
@@ -4221,7 +4238,8 @@ list_full_offset_index_init(offset_index *offidx, uint8_t *idx_mem_ptr,
 }
 
 static bool
-list_full_offset_index_fill_to(offset_index *offidx, uint32_t index)
+list_full_offset_index_fill_to(offset_index *offidx, uint32_t index,
+		bool check_storage)
 {
 	uint32_t start = offset_index_get_filled(offidx);
 
@@ -4238,7 +4256,7 @@ list_full_offset_index_fill_to(offset_index *offidx, uint32_t index)
 	};
 
 	for (uint32_t i = start; i < index; i++) {
-		if (as_unpack_size(&pk) <= 0) {
+		if (cdt_get_msgpack_sz(&pk, check_storage) == 0) {
 			return false;
 		}
 
@@ -4251,9 +4269,10 @@ list_full_offset_index_fill_to(offset_index *offidx, uint32_t index)
 }
 
 bool
-list_full_offset_index_fill_all(offset_index *offidx)
+list_full_offset_index_fill_all(offset_index *offidx, bool check_storage)
 {
-	return list_full_offset_index_fill_to(offidx, offidx->_.ele_count);
+	return list_full_offset_index_fill_to(offidx, offidx->_.ele_count,
+			check_storage);
 }
 
 
@@ -4499,7 +4518,7 @@ list_result_data_set_values_by_ordidx(cdt_result_data *rd,
 			uint32_t sz = offset_index_get_delta_const(full_offidx, i);
 
 			return as_bin_particle_alloc_from_msgpack(rd->result,
-					full_offidx->contents + offset, sz) == AS_PROTO_RESULT_OK;
+					full_offidx->contents + offset, sz) == AS_OK;
 		}
 
 		return true;

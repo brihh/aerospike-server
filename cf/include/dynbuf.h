@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -53,6 +54,8 @@ extern void cf_dyn_buf_append_int(cf_dyn_buf *db, int i);
 extern void cf_dyn_buf_append_uint64_x(cf_dyn_buf *db, uint64_t i); // HEX FORMAT!
 extern void cf_dyn_buf_append_uint64(cf_dyn_buf *db, uint64_t i);
 extern void cf_dyn_buf_append_uint32(cf_dyn_buf *db, uint32_t i);
+extern void cf_dyn_buf_append_format_va(cf_dyn_buf *db, const char *form, va_list va);
+extern void cf_dyn_buf_append_format(cf_dyn_buf *db, const char *form, ...);
 extern void cf_dyn_buf_chomp(cf_dyn_buf *db);
 extern char *cf_dyn_buf_strdup(cf_dyn_buf *db);
 extern void cf_dyn_buf_free(cf_dyn_buf *db);
@@ -65,6 +68,7 @@ void info_append_string_safe(cf_dyn_buf *db, const char *name, const char *value
 void info_append_uint32(cf_dyn_buf *db, const char *name, uint32_t value);
 void info_append_uint64(cf_dyn_buf *db, const char *name, uint64_t value);
 void info_append_uint64_x(cf_dyn_buf *db, const char *name, uint64_t value);
+void info_append_format(cf_dyn_buf *db, const char *name, const char *form, ...);
 
 // Append indexed name with optional attribute and value: name[ix].attr=value;
 void info_append_indexed_string(cf_dyn_buf *db, const char *name, uint32_t ix, const char *attr, const char *value);
@@ -78,13 +82,10 @@ typedef struct cf_buf_builder_s {
 	uint8_t buf[];
 } cf_buf_builder;
 
-extern cf_buf_builder *cf_buf_builder_create();
-extern cf_buf_builder *cf_buf_builder_create_size(size_t sz);
+extern cf_buf_builder *cf_buf_builder_create(size_t sz);
 extern void cf_buf_builder_free(cf_buf_builder *bb);
 extern void cf_buf_builder_reset(cf_buf_builder *bb);
 extern void cf_buf_builder_chomp(cf_buf_builder *bb_r);
-// If you use any binary components, this strdup thing is a bad idea:
-extern char *cf_buf_builder_strdup(cf_buf_builder *bb_r);
 
 extern void cf_buf_builder_append_string(cf_buf_builder **bb_r, const char *s);
 extern void cf_buf_builder_append_char(cf_buf_builder **bb_r, char c);

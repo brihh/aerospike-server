@@ -50,6 +50,24 @@
 //
 
 //--------------------------------------
+// as_storage_cfg_init
+//
+
+typedef void (*as_storage_cfg_init_fn)(as_namespace *ns);
+static const as_storage_cfg_init_fn as_storage_cfg_init_table[AS_NUM_STORAGE_ENGINES] = {
+	NULL, // memory doesn't need this
+	as_storage_cfg_init_ssd
+};
+
+void
+as_storage_cfg_init(as_namespace *ns)
+{
+	if (as_storage_cfg_init_table[ns->storage_type]) {
+		as_storage_cfg_init_table[ns->storage_type](ns);
+	}
+}
+
+//--------------------------------------
 // as_storage_init
 //
 
@@ -205,6 +223,7 @@ as_storage_record_create(as_namespace *ns, as_record *r, as_storage_rd *rd)
 	rd->set_name = NULL;
 	rd->key_size = 0;
 	rd->key = NULL;
+	rd->read_page_cache = false;
 	rd->is_durable_delete = false;
 
 	if (as_storage_record_create_table[ns->storage_type]) {
@@ -237,6 +256,7 @@ as_storage_record_open(as_namespace *ns, as_record *r, as_storage_rd *rd)
 	rd->set_name = NULL;
 	rd->key_size = 0;
 	rd->key = NULL;
+	rd->read_page_cache = false;
 	rd->is_durable_delete = false;
 
 	if (as_storage_record_open_table[ns->storage_type]) {
@@ -463,20 +483,38 @@ as_storage_save_regime(as_namespace *ns)
 }
 
 //--------------------------------------
-// as_storage_save_evict_void_time
+// as_storage_load_roster_generation
 //
 
-typedef void (*as_storage_save_evict_void_time_fn)(as_namespace *ns, uint32_t evict_void_time);
-static const as_storage_save_evict_void_time_fn as_storage_save_evict_void_time_table[AS_NUM_STORAGE_ENGINES] = {
+typedef void (*as_storage_load_roster_generation_fn)(as_namespace *ns);
+static const as_storage_load_roster_generation_fn as_storage_load_roster_generation_table[AS_NUM_STORAGE_ENGINES] = {
 	NULL, // memory doesn't store info
-	as_storage_save_evict_void_time_ssd
+	as_storage_load_roster_generation_ssd
 };
 
 void
-as_storage_save_evict_void_time(as_namespace *ns, uint32_t evict_void_time)
+as_storage_load_roster_generation(as_namespace *ns)
 {
-	if (as_storage_save_evict_void_time_table[ns->storage_type]) {
-		as_storage_save_evict_void_time_table[ns->storage_type](ns, evict_void_time);
+	if (as_storage_load_roster_generation_table[ns->storage_type]) {
+		as_storage_load_roster_generation_table[ns->storage_type](ns);
+	}
+}
+
+//--------------------------------------
+// as_storage_save_roster_generation
+//
+
+typedef void (*as_storage_save_roster_generation_fn)(as_namespace *ns);
+static const as_storage_save_roster_generation_fn as_storage_save_roster_generation_table[AS_NUM_STORAGE_ENGINES] = {
+	NULL, // memory doesn't store info
+	as_storage_save_roster_generation_ssd
+};
+
+void
+as_storage_save_roster_generation(as_namespace *ns)
+{
+	if (as_storage_save_roster_generation_table[ns->storage_type]) {
+		as_storage_save_roster_generation_table[ns->storage_type](ns);
 	}
 }
 

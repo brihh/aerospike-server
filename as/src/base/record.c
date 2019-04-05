@@ -103,6 +103,15 @@ next_generation(uint16_t local, uint16_t remote, as_namespace* ns)
 	return local == 0xFFFF ? remote == 1 : remote - local == 1;
 }
 
+// Quietly trim void-time. (Clock on remote node different?) TODO - best way?
+static inline uint32_t
+trim_void_time(uint32_t void_time)
+{
+	uint32_t max_void_time = as_record_void_time_get() + MAX_ALLOWED_TTL;
+
+	return void_time > max_void_time ? max_void_time : void_time;
+}
+
 
 //==========================================================
 // Public API - record lock lifecycle.
@@ -263,6 +272,36 @@ as_record_destroy_bins_from(as_storage_rd *rd, uint16_t from)
 }
 
 
+// Note - this is not called on the master write (or durable delete) path, where
+// keys are stored but never dropped. Only a UDF will drop a key on master.
+void
+as_record_finalize_key(as_record *r, as_namespace *ns, const uint8_t *key,
+		uint32_t key_size)
+{
+	// If a key wasn't stored, and we got one, accommodate it.
+	if (r->key_stored == 0) {
+		if (key != NULL) {
+			if (ns->storage_data_in_memory) {
+				as_record_allocate_key(r, key, key_size);
+			}
+
+			r->key_stored = 1;
+		}
+	}
+	// If a key was stored, but we didn't get one, remove the key.
+	else if (key == NULL) {
+		if (ns->storage_data_in_memory) {
+			as_bin_space *bin_space = ((as_rec_space *)r->dim)->bin_space;
+
+			cf_free(r->dim);
+			r->dim = (void *)bin_space;
+		}
+
+		r->key_stored = 0;
+	}
+}
+
+
 // Called only for data-in-memory multi-bin, with no key currently stored.
 // Note - have to modify if/when other metadata joins key in as_rec_space.
 void
@@ -276,18 +315,6 @@ as_record_allocate_key(as_record *r, const uint8_t *key, uint32_t key_size)
 	memcpy((void*)rec_space->key, (const void*)key, key_size);
 
 	r->dim = (void*)rec_space;
-}
-
-
-// Called only for data-in-memory multi-bin, with a key currently stored.
-// Note - have to modify if/when other metadata joins key in as_rec_space.
-void
-as_record_remove_key(as_record *r)
-{
-	as_bin_space *p_bin_space = ((as_rec_space *)r->dim)->bin_space;
-
-	cf_free(r->dim);
-	r->dim = (void *)p_bin_space;
 }
 
 
@@ -353,7 +380,7 @@ as_record_replace_if_better(as_remote_record *rr, bool is_repl_write,
 
 	if (! as_storage_has_space(ns)) {
 		cf_warning(AS_RECORD, "{%s} record replace: drives full", ns->name);
-		return AS_PROTO_RESULT_FAIL_OUT_OF_SPACE;
+		return AS_ERR_OUT_OF_SPACE;
 	}
 
 	CF_ALLOC_SET_NS_ARENA(ns);
@@ -364,7 +391,7 @@ as_record_replace_if_better(as_remote_record *rr, bool is_repl_write,
 	int rv = as_record_get_create(tree, rr->keyd, &r_ref, ns);
 
 	if (rv < 0) {
-		return AS_PROTO_RESULT_FAIL_OUT_OF_SPACE;
+		return AS_ERR_OUT_OF_SPACE;
 	}
 
 	bool is_create = rv == 1;
@@ -378,7 +405,7 @@ as_record_replace_if_better(as_remote_record *rr, bool is_repl_write,
 		bool from_replica;
 
 		if ((result = as_partition_check_source(ns, rr->rsv->p, rr->src,
-				&from_replica)) != AS_PROTO_RESULT_OK) {
+				&from_replica)) != AS_OK) {
 			record_replace_failed(rr, &r_ref, NULL, is_create);
 			return result;
 		}
@@ -389,7 +416,7 @@ as_record_replace_if_better(as_remote_record *rr, bool is_repl_write,
 
 	if (! is_create && record_replace_check(r, ns) < 0) {
 		record_replace_failed(rr, &r_ref, NULL, is_create);
-		return AS_PROTO_RESULT_FAIL_FORBIDDEN;
+		return AS_ERR_FORBIDDEN;
 	}
 
 	// If local record is better, no-op or fail.
@@ -397,9 +424,7 @@ as_record_replace_if_better(as_remote_record *rr, bool is_repl_write,
 			r->generation, r->last_update_time, (uint16_t)rr->generation,
 			rr->last_update_time)) <= 0) {
 		record_replace_failed(rr, &r_ref, NULL, is_create);
-		return result == 0 ?
-				AS_PROTO_RESULT_FAIL_RECORD_EXISTS :
-				AS_PROTO_RESULT_FAIL_GENERATION;
+		return result == 0 ? AS_ERR_RECORD_EXISTS : AS_ERR_GENERATION;
 	}
 	// else - remote winner - apply it.
 
@@ -416,7 +441,7 @@ as_record_replace_if_better(as_remote_record *rr, bool is_repl_write,
 		// Don't write record if it would be truncated.
 		if (as_truncate_record_is_truncated(r, ns)) {
 			record_replace_failed(rr, &r_ref, NULL, is_create);
-			return AS_PROTO_RESULT_OK;
+			return AS_OK;
 		}
 	}
 	// else - not bothering to check that sets match.
@@ -434,9 +459,8 @@ as_record_replace_if_better(as_remote_record *rr, bool is_repl_write,
 	rd.set_name = rr->set_name;
 	rd.set_name_len = rr->set_name_len;
 
-	// Prepare to store key, if there is one.
-	rd.key = rr->key;
-	rd.key_size = rr->key_size;
+	// Note - deal with key after reading existing record (if such), in case
+	// we're dropping the key.
 
 	// Split according to configuration to replace local record.
 	bool is_delete = false;
@@ -474,7 +498,7 @@ as_record_replace_if_better(as_remote_record *rr, bool is_repl_write,
 		xdr_write_replica(rr, is_delete, set_id);
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 
@@ -562,7 +586,7 @@ record_apply_dim_single_bin(as_remote_record *rr, as_storage_rd *rd,
 
 	if (n_new_bins > 1) {
 		cf_warning_digest(AS_RECORD, rr->keyd, "{%s} record replace: single-bin got %u bins ", ns->name, n_new_bins);
-		return AS_PROTO_RESULT_FAIL_UNKNOWN;
+		return AS_ERR_UNKNOWN;
 	}
 
 	// Keep old bin intact for unwinding, clear record bin for incoming.
@@ -600,7 +624,7 @@ record_apply_dim_single_bin(as_remote_record *rr, as_storage_rd *rd,
 	as_storage_record_adjust_mem_stats(rd, memory_bytes);
 	*is_delete = n_new_bins == 0;
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 
@@ -645,6 +669,10 @@ record_apply_dim(as_remote_record *rr, as_storage_rd *rd, bool skip_sindex,
 
 	update_index_metadata(rr, &old_metadata, r);
 
+	// Prepare to store or drop key, as determined by message.
+	rd->key = rr->key;
+	rd->key_size = rr->key_size;
+
 	// Write the record to storage.
 	if ((result = as_record_write_from_pickle(rd)) < 0) {
 		cf_warning_digest(AS_RECORD, rr->keyd, "{%s} record replace: failed write ", ns->name);
@@ -684,16 +712,13 @@ record_apply_dim(as_remote_record *rr, as_storage_rd *rd, bool skip_sindex,
 
 	as_index_set_bin_space(r, new_bin_space);
 
-	// Accommodate a new stored key - wasn't needed for pickling and writing.
-	if (r->key_stored == 0 && rd->key) {
-		as_record_allocate_key(r, rd->key, rd->key_size);
-		r->key_stored = 1;
-	}
+	// Now ok to store or drop key, as determined by message.
+	as_record_finalize_key(r, ns, rd->key, rd->key_size);
 
 	as_storage_record_adjust_mem_stats(rd, memory_bytes);
 	*is_delete = n_new_bins == 0;
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 
@@ -708,7 +733,7 @@ record_apply_ssd_single_bin(as_remote_record *rr, as_storage_rd *rd,
 
 	if (n_new_bins > 1) {
 		cf_warning_digest(AS_RECORD, rr->keyd, "{%s} record replace: single-bin got %u bins ", ns->name, n_new_bins);
-		return AS_PROTO_RESULT_FAIL_UNKNOWN;
+		return AS_ERR_UNKNOWN;
 	}
 
 	as_bin stack_bin = { { 0 } };
@@ -733,6 +758,10 @@ record_apply_ssd_single_bin(as_remote_record *rr, as_storage_rd *rd,
 
 	update_index_metadata(rr, &old_metadata, r);
 
+	// Prepare to store or drop key, as determined by message.
+	rd->key = rr->key;
+	rd->key_size = rr->key_size;
+
 	// Write the record to storage.
 	if ((result = as_record_write_from_pickle(rd)) < 0) {
 		cf_warning_digest(AS_RECORD, rr->keyd, "{%s} record replace: failed write ", ns->name);
@@ -741,16 +770,14 @@ record_apply_ssd_single_bin(as_remote_record *rr, as_storage_rd *rd,
 		return -result;
 	}
 
-	// Accommodate a new stored key - wasn't needed for writing.
-	if (r->key_stored == 0 && rr->key) {
-		r->key_stored = 1;
-	}
+	// Now ok to store or drop key, as determined by message.
+	as_record_finalize_key(r, ns, rd->key, rd->key_size);
 
 	*is_delete = n_new_bins == 0;
 
 	cf_ll_buf_free(&particles_llb);
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 
@@ -809,6 +836,10 @@ record_apply_ssd(as_remote_record *rr, as_storage_rd *rd, bool skip_sindex,
 
 	update_index_metadata(rr, &old_metadata, r);
 
+	// Prepare to store or drop key, as determined by message.
+	rd->key = rr->key;
+	rd->key_size = rr->key_size;
+
 	// Write the record to storage.
 	if ((result = as_record_write_from_pickle(rd)) < 0) {
 		cf_warning_digest(AS_RECORD, rr->keyd, "{%s} record replace: failed write ", ns->name);
@@ -823,16 +854,14 @@ record_apply_ssd(as_remote_record *rr, as_storage_rd *rd, bool skip_sindex,
 				old_bins, n_old_bins, new_bins, n_new_bins);
 	}
 
-	// Accommodate a new stored key - wasn't needed for writing.
-	if (r->key_stored == 0 && rr->key) {
-		r->key_stored = 1;
-	}
+	// Now ok to store or drop key, as determined by message.
+	as_record_finalize_key(r, ns, rd->key, rd->key_size);
 
 	*is_delete = n_new_bins == 0;
 
 	cf_ll_buf_free(&particles_llb);
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 
@@ -844,7 +873,7 @@ update_index_metadata(as_remote_record *rr, index_metadata *old, as_record *r)
 	old->generation = r->generation;
 
 	r->generation = (uint16_t)rr->generation;
-	r->void_time = truncate_void_time(rr->rsv->ns, rr->void_time);
+	r->void_time = trim_void_time(rr->void_time);
 	r->last_update_time = rr->last_update_time;
 }
 
@@ -880,7 +909,7 @@ unpickle_bins(as_remote_record *rr, as_storage_rd *rd, cf_ll_buf *particles_llb)
 	for (uint16_t i = 0; i < rd->n_bins; i++) {
 		if (buf >= end) {
 			cf_warning(AS_RECORD, "incomplete pickled record");
-			return AS_PROTO_RESULT_FAIL_UNKNOWN;
+			return AS_ERR_UNKNOWN;
 		}
 
 		uint8_t name_sz = *buf++;
@@ -891,7 +920,7 @@ unpickle_bins(as_remote_record *rr, as_storage_rd *rd, cf_ll_buf *particles_llb)
 
 		if (buf > end) {
 			cf_warning(AS_RECORD, "incomplete pickled record");
-			return AS_PROTO_RESULT_FAIL_UNKNOWN;
+			return AS_ERR_UNKNOWN;
 		}
 
 		int result;
@@ -917,10 +946,10 @@ unpickle_bins(as_remote_record *rr, as_storage_rd *rd, cf_ll_buf *particles_llb)
 
 	if (buf != end) {
 		cf_warning(AS_RECORD, "extra bytes on pickled record");
-		return AS_PROTO_RESULT_FAIL_UNKNOWN;
+		return AS_ERR_UNKNOWN;
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 

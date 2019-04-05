@@ -44,8 +44,8 @@
 // COMPILER_ASSERT(sizeof(my_int_array) / sizeof(int) == MY_INT_ARRAY_SIZE);
 //
 #define CGLUE(a, b) a##b
-#define CVERIFY(expr, line) typedef char CGLUE(compiler_assert_failed_on_line_, line)[(expr) ? 1 : -1]
-#define COMPILER_ASSERT(expr) CVERIFY(expr, __LINE__)
+#define CVERIFY(expr, counter) typedef char CGLUE(compiler_assert_failed_, counter)[(expr) ? 1 : -1]
+#define COMPILER_ASSERT(expr) CVERIFY(expr, __COUNTER__)
 
 // Use CF_MUST_CHECK with declarations to force caller to handle return value.
 //
@@ -156,6 +156,7 @@ typedef enum {
 	CF_SOCKET,
 	CF_TLS,
 	CF_VMAPX,
+	CF_XMEM,
 
 	AS_AGGR,
 	AS_APPEAL,
@@ -164,13 +165,12 @@ typedef enum {
 	AS_BIN,
 	AS_CFG,
 	AS_CLUSTERING,
-	AS_COMPRESSION,
-	AS_DEMARSHAL,
 	AS_DRV_SSD,
 	AS_EXCHANGE,
 	AS_FABRIC,
 	AS_GEO,
 	AS_HB,
+	AS_HEALTH,
 	AS_HLC,
 	AS_INDEX,
 	AS_INFO,
@@ -194,6 +194,8 @@ typedef enum {
 	AS_RW_CLIENT, // special detail context
 	AS_SCAN,
 	AS_SECURITY,
+	AS_SERVICE,
+	AS_SERVICE_LIST,
 	AS_SINDEX,
 	AS_SKEW,
 	AS_SMD,
@@ -202,6 +204,8 @@ typedef enum {
 	AS_TSVC,
 	AS_UDF,
 	AS_XDR,
+	AS_XDR_CLIENT,
+	AS_XDR_HTTP,
 	CF_FAULT_CONTEXT_UNDEF
 } cf_fault_context;
 

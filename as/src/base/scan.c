@@ -28,7 +28,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -47,6 +46,8 @@
 #include "citrusleaf/cf_ll.h"
 #include "citrusleaf/cf_vector.h"
 
+#include "cf_mutex.h"
+#include "cf_thread.h"
 #include "dynbuf.h"
 #include "fault.h"
 #include "socket.h"
@@ -62,7 +63,6 @@
 #include "base/secondary_index.h"
 #include "base/thr_tsvc.h"
 #include "base/transaction.h"
-#include "base/udf_memtracker.h"
 #include "fabric/exchange.h"
 #include "fabric/partition.h"
 #include "transaction/udf.h"
@@ -163,7 +163,7 @@ as_scan(as_transaction* tr, as_namespace* ns)
 	int result;
 	uint16_t set_id = INVALID_SET_ID;
 
-	if ((result = get_scan_set_id(tr, ns, &set_id)) != AS_PROTO_RESULT_OK) {
+	if ((result = get_scan_set_id(tr, ns, &set_id)) != AS_OK) {
 		return result;
 	}
 
@@ -179,7 +179,7 @@ as_scan(as_transaction* tr, as_namespace* ns)
 		break;
 	default:
 		cf_warning(AS_SCAN, "can't identify scan type");
-		result = AS_PROTO_RESULT_FAIL_PARAMETER;
+		result = AS_ERR_PARAMETER;
 		break;
 	}
 
@@ -271,13 +271,13 @@ get_scan_set_id(as_transaction* tr, as_namespace* ns, uint16_t* p_set_id)
 		if (set_id == INVALID_SET_ID) {
 			cf_warning(AS_SCAN, "scan msg from %s has unrecognized set %s",
 					tr->from.proto_fd_h->client, set_name);
-			return AS_PROTO_RESULT_FAIL_NOT_FOUND;
+			return AS_ERR_NOT_FOUND;
 		}
 	}
 
 	*p_set_id = set_id;
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 scan_type
@@ -408,7 +408,7 @@ typedef struct conn_scan_job_s {
 	as_job			_base;
 
 	// Derived class data:
-	pthread_mutex_t	fd_lock;
+	cf_mutex		fd_lock;
 	as_file_handle*	fd_h;
 	int32_t			fd_timeout;
 
@@ -429,10 +429,10 @@ void conn_scan_job_info(conn_scan_job* job, as_mon_jobstat* stat);
 void
 conn_scan_job_own_fd(conn_scan_job* job, as_file_handle* fd_h, uint32_t timeout)
 {
-	pthread_mutex_init(&job->fd_lock, NULL);
+	cf_mutex_init(&job->fd_lock);
 
 	job->fd_h = fd_h;
-	job->fd_h->fh_info |= FH_INFO_DONOT_REAP;
+	job->fd_h->do_not_reap = true;
 	job->fd_timeout = timeout == 0 ? -1 : (int32_t)timeout;
 
 	job->net_io_bytes = 0;
@@ -443,9 +443,9 @@ conn_scan_job_disown_fd(conn_scan_job* job)
 {
 	// Just undo conn_scan_job_own_fd(), nothing more.
 
-	job->fd_h->fh_info &= ~FH_INFO_DONOT_REAP;
+	job->fd_h->do_not_reap = false;
 
-	pthread_mutex_destroy(&job->fd_lock);
+	cf_mutex_destroy(&job->fd_lock);
 }
 
 void
@@ -462,7 +462,7 @@ conn_scan_job_finish(conn_scan_job* job)
 		conn_scan_job_release_fd(job, size_sent == 0);
 	}
 
-	pthread_mutex_destroy(&job->fd_lock);
+	cf_mutex_destroy(&job->fd_lock);
 }
 
 bool
@@ -470,10 +470,10 @@ conn_scan_job_send_response(conn_scan_job* job, uint8_t* buf, size_t size)
 {
 	as_job* _job = (as_job*)job;
 
-	pthread_mutex_lock(&job->fd_lock);
+	cf_mutex_lock(&job->fd_lock);
 
 	if (! job->fd_h) {
-		pthread_mutex_unlock(&job->fd_lock);
+		cf_mutex_unlock(&job->fd_lock);
 		// Job already abandoned.
 		return false;
 	}
@@ -486,22 +486,22 @@ conn_scan_job_send_response(conn_scan_job* job, uint8_t* buf, size_t size)
 				AS_JOB_FAIL_RESPONSE_TIMEOUT : AS_JOB_FAIL_RESPONSE_ERROR;
 
 		conn_scan_job_release_fd(job, true);
-		pthread_mutex_unlock(&job->fd_lock);
+		cf_mutex_unlock(&job->fd_lock);
 		as_job_manager_abandon_job(_job->mgr, _job, reason);
 		return false;
 	}
 
 	job->net_io_bytes += size_sent;
 
-	pthread_mutex_unlock(&job->fd_lock);
+	cf_mutex_unlock(&job->fd_lock);
 	return true;
 }
 
 void
 conn_scan_job_release_fd(conn_scan_job* job, bool force_close)
 {
-	job->fd_h->fh_info &= ~FH_INFO_DONOT_REAP;
-	job->fd_h->last_used = cf_getms();
+	job->fd_h->do_not_reap = false;
+	job->fd_h->last_used = cf_getns();
 	as_end_of_transaction(job->fd_h, force_close);
 	job->fd_h = NULL;
 }
@@ -510,6 +510,7 @@ void
 conn_scan_job_info(conn_scan_job* job, as_mon_jobstat* stat)
 {
 	stat->net_io_bytes = job->net_io_bytes;
+	stat->socket_timeout = job->fd_timeout;
 }
 
 
@@ -574,11 +575,12 @@ basic_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 			! get_scan_predexp(tr, &predexp)) {
 		cf_warning(AS_SCAN, "basic scan job failed msg field processing");
 		cf_free(job);
-		return AS_PROTO_RESULT_FAIL_PARAMETER;
+		return AS_ERR_PARAMETER;
 	}
 
 	as_job_init(_job, &basic_scan_job_vtable, &g_scan_manager, RSV_WRITE,
-			as_transaction_trid(tr), ns, set_id, options.priority);
+			as_transaction_trid(tr), ns, set_id, options.priority,
+			tr->from.proto_fd_h->client);
 
 	job->cluster_key = as_exchange_cluster_key();
 	job->fail_on_cluster_change = options.fail_on_cluster_change;
@@ -590,7 +592,7 @@ basic_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 
 	job->bin_names = bin_names_from_op(&tr->msgp->msg, &result);
 
-	if (! job->bin_names && result != AS_PROTO_RESULT_OK) {
+	if (! job->bin_names && result != AS_OK) {
 		as_job_destroy(_job);
 		return result;
 	}
@@ -598,20 +600,21 @@ basic_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 	if (job->fail_on_cluster_change &&
 			(cf_atomic_int_get(ns->migrate_tx_partitions_remaining) != 0 ||
 			 cf_atomic_int_get(ns->migrate_rx_partitions_remaining) != 0)) {
-		// TODO - was AS_PROTO_RESULT_FAIL_UNAVAILABLE - ok?
+		// TODO - was AS_ERR_UNAVAILABLE - ok?
 		cf_warning(AS_SCAN, "basic scan job not started - migration");
 		as_job_destroy(_job);
-		return AS_PROTO_RESULT_FAIL_CLUSTER_KEY_MISMATCH;
+		return AS_ERR_CLUSTER_KEY_MISMATCH;
 	}
 
 	// Take ownership of socket from transaction.
 	conn_scan_job_own_fd((conn_scan_job*)job, tr->from.proto_fd_h, timeout);
 
-	cf_info(AS_SCAN, "starting basic scan job %lu {%s:%s} priority %u, sample-pct %u%s%s",
+	cf_info(AS_SCAN, "starting basic scan job %lu {%s:%s} priority %u sample-pct %u%s%s socket-timeout %u from %s",
 			_job->trid, ns->name, as_namespace_get_set_name(ns, set_id),
 			_job->priority, job->sample_pct,
 			job->no_bin_data ? ", metadata-only" : "",
-			job->fail_on_cluster_change ? ", fail-on-cluster-change" : "");
+			job->fail_on_cluster_change ? ", fail-on-cluster-change" : "",
+			timeout, _job->client);
 
 	if ((result = as_job_manager_start_job(_job->mgr, _job)) != 0) {
 		cf_warning(AS_SCAN, "basic scan job %lu failed to start (%d)",
@@ -621,7 +624,7 @@ basic_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 		return result;
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 //----------------------------------------------------------
@@ -633,14 +636,7 @@ basic_scan_job_slice(as_job* _job, as_partition_reservation* rsv)
 {
 	basic_scan_job* job = (basic_scan_job*)_job;
 	as_index_tree* tree = rsv->tree;
-	cf_buf_builder* bb = cf_buf_builder_create_size(INIT_BUF_BUILDER_SIZE);
-
-	if (! bb) {
-		as_job_manager_abandon_job(_job->mgr, _job,
-				AS_PROTO_RESULT_FAIL_UNKNOWN);
-		return;
-	}
-
+	cf_buf_builder* bb = cf_buf_builder_create(INIT_BUF_BUILDER_SIZE);
 	uint64_t slice_start = cf_getms();
 	basic_scan_slice slice = { job, &bb };
 
@@ -662,8 +658,8 @@ basic_scan_job_slice(as_job* _job, as_partition_reservation* rsv)
 	// TODO - guts don't check buf_builder realloc failures rigorously.
 	cf_buf_builder_free(bb);
 
-	cf_detail(AS_SCAN, "%s:%u basic scan job %lu in thread %lu took %lu ms",
-			rsv->ns->name, rsv->p->id, _job->trid, pthread_self(),
+	cf_detail(AS_SCAN, "%s:%u basic scan job %lu in thread %d took %lu ms",
+			rsv->ns->name, rsv->p->id, _job->trid, cf_thread_sys_tid(),
 			cf_getms() - slice_start);
 }
 
@@ -734,7 +730,7 @@ basic_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 			job->cluster_key != as_exchange_cluster_key()) {
 		as_record_done(r_ref, ns);
 		as_job_manager_abandon_job(_job->mgr, _job,
-				AS_PROTO_RESULT_FAIL_CLUSTER_KEY_MISMATCH);
+				AS_ERR_CLUSTER_KEY_MISMATCH);
 		return;
 	}
 
@@ -759,8 +755,7 @@ basic_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 	if (job->no_bin_data) {
 		// TODO - suppose the predexp needs bin values???
 
-		as_msg_make_response_bufbuilder(slice->bb_r, &rd, true, true, true,
-				NULL);
+		as_msg_make_response_bufbuilder(slice->bb_r, &rd, true, NULL);
 	}
 	else {
 		as_storage_rd_load_n_bins(&rd); // TODO - handle error returned
@@ -777,7 +772,7 @@ basic_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 			return;
 		}
 
-		as_msg_make_response_bufbuilder(slice->bb_r, &rd, false, true, true,
+		as_msg_make_response_bufbuilder(slice->bb_r, &rd, false,
 				job->bin_names);
 	}
 
@@ -803,7 +798,7 @@ basic_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 cf_vector*
 bin_names_from_op(as_msg* m, int* result)
 {
-	*result = AS_PROTO_RESULT_OK;
+	*result = AS_OK;
 
 	if (m->n_ops == 0) {
 		return NULL;
@@ -818,7 +813,7 @@ bin_names_from_op(as_msg* m, int* result)
 		if (op->name_sz >= AS_BIN_NAME_MAX_SZ) {
 			cf_warning(AS_SCAN, "basic scan job bin name too long");
 			cf_vector_destroy(v);
-			*result = AS_PROTO_RESULT_FAIL_BIN_NAME;
+			*result = AS_ERR_BIN_NAME;
 			return NULL;
 		}
 
@@ -904,30 +899,31 @@ aggr_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 			! get_scan_socket_timeout(tr, &timeout)) {
 		cf_warning(AS_SCAN, "aggregation scan job failed msg field processing");
 		cf_free(job);
-		return AS_PROTO_RESULT_FAIL_PARAMETER;
+		return AS_ERR_PARAMETER;
 	}
 
 	if (as_transaction_has_predexp(tr)) {
 		cf_warning(AS_SCAN, "aggregation scans do not support predexp filters");
 		cf_free(job);
-		return AS_PROTO_RESULT_FAIL_UNSUPPORTED_FEATURE;
+		return AS_ERR_UNSUPPORTED_FEATURE;
 	}
 
 	as_job_init(_job, &aggr_scan_job_vtable, &g_scan_manager, RSV_WRITE,
-			as_transaction_trid(tr), ns, set_id, options.priority);
+			as_transaction_trid(tr), ns, set_id, options.priority,
+			tr->from.proto_fd_h->client);
 
 	if (! aggr_scan_init(&job->aggr_call, tr)) {
 		cf_warning(AS_SCAN, "aggregation scan job failed call init");
 		as_job_destroy(_job);
-		return AS_PROTO_RESULT_FAIL_PARAMETER;
+		return AS_ERR_PARAMETER;
 	}
 
 	// Take ownership of socket from transaction.
 	conn_scan_job_own_fd((conn_scan_job*)job, tr->from.proto_fd_h, timeout);
 
-	cf_info(AS_SCAN, "starting aggregation scan job %lu {%s:%s} priority %u",
+	cf_info(AS_SCAN, "starting aggregation scan job %lu {%s:%s} priority %u socket-timeout %u from %s",
 			_job->trid, ns->name, as_namespace_get_set_name(ns, set_id),
-			_job->priority);
+			_job->priority, timeout, _job->client);
 
 	int result = as_job_manager_start_job(_job->mgr, _job);
 
@@ -939,7 +935,7 @@ aggr_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 		return result;
 	}
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 //----------------------------------------------------------
@@ -951,16 +947,10 @@ aggr_scan_job_slice(as_job* _job, as_partition_reservation* rsv)
 {
 	aggr_scan_job* job = (aggr_scan_job*)_job;
 	cf_ll ll;
-	cf_buf_builder* bb = cf_buf_builder_create_size(INIT_BUF_BUILDER_SIZE);
-
-	if (! bb) {
-		as_job_manager_abandon_job(_job->mgr, _job,
-				AS_PROTO_RESULT_FAIL_UNKNOWN);
-		return;
-	}
 
 	cf_ll_init(&ll, as_index_keys_ll_destroy_fn, false);
 
+	cf_buf_builder* bb = cf_buf_builder_create(INIT_BUF_BUILDER_SIZE);
 	aggr_scan_slice slice = { job, &ll, &bb, rsv };
 
 	as_index_reduce_live(rsv->tree, aggr_scan_job_reduce_cb, (void*)&slice);
@@ -992,8 +982,7 @@ aggr_scan_job_slice(as_job* _job, as_partition_reservation* rsv)
 			aggr_scan_add_val_response(&slice, v, false);
 			as_val_destroy(v);
 			cf_free(rs);
-			as_job_manager_abandon_job(_job->mgr, _job,
-					AS_PROTO_RESULT_FAIL_UNKNOWN);
+			as_job_manager_abandon_job(_job->mgr, _job, AS_ERR_UNKNOWN);
 		}
 
 		as_result_destroy(&result);
@@ -1096,8 +1085,7 @@ aggr_scan_job_reduce_cb(as_index_ref* r_ref, void* udata)
 
 	if (! aggr_scan_add_digest(slice->ll, &r->keyd)) {
 		as_record_done(r_ref, ns);
-		as_job_manager_abandon_job(_job->mgr, _job,
-				AS_PROTO_RESULT_FAIL_UNKNOWN);
+		as_job_manager_abandon_job(_job->mgr, _job, AS_ERR_UNKNOWN);
 		return;
 	}
 
@@ -1234,11 +1222,12 @@ udf_bg_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 	if (! get_scan_options(tr, &options) || ! get_scan_predexp(tr, &predexp)) {
 		cf_warning(AS_SCAN, "udf-bg scan job failed msg field processing");
 		cf_free(job);
-		return AS_PROTO_RESULT_FAIL_PARAMETER;
+		return AS_ERR_PARAMETER;
 	}
 
 	as_job_init(_job, &udf_bg_scan_job_vtable, &g_scan_manager, RSV_WRITE,
-			as_transaction_trid(tr), ns, set_id, options.priority);
+			as_transaction_trid(tr), ns, set_id, options.priority,
+			tr->from.proto_fd_h->client);
 
 	job->origin.predexp = predexp;
 	job->is_durable_delete = as_transaction_is_durable_delete(tr);
@@ -1249,15 +1238,15 @@ udf_bg_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 	if (! udf_def_init_from_msg(&job->origin.def, tr)) {
 		cf_warning(AS_SCAN, "udf-bg scan job failed def init");
 		as_job_destroy(_job);
-		return AS_PROTO_RESULT_FAIL_PARAMETER;
+		return AS_ERR_PARAMETER;
 	}
 
 	job->origin.cb = udf_bg_scan_tr_complete;
 	job->origin.udata = (void*)job;
 
-	cf_info(AS_SCAN, "starting udf-bg scan job %lu {%s:%s} priority %u",
+	cf_info(AS_SCAN, "starting udf-bg scan job %lu {%s:%s} priority %u from %s",
 			_job->trid, ns->name, as_namespace_get_set_name(ns, set_id),
-			_job->priority);
+			_job->priority, _job->client);
 
 	int result = as_job_manager_start_job(_job->mgr, _job);
 
@@ -1268,8 +1257,8 @@ udf_bg_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 		return result;
 	}
 
-	if (as_msg_send_fin(&tr->from.proto_fd_h->sock, AS_PROTO_RESULT_OK)) {
-		tr->from.proto_fd_h->last_used = cf_getms();
+	if (as_msg_send_fin(&tr->from.proto_fd_h->sock, AS_OK)) {
+		tr->from.proto_fd_h->last_used = cf_getns();
 		as_end_of_transaction_ok(tr->from.proto_fd_h);
 	}
 	else {
@@ -1280,7 +1269,7 @@ udf_bg_scan_job_start(as_transaction* tr, as_namespace* ns, uint16_t set_id)
 
 	tr->from.proto_fd_h = NULL;
 
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 //----------------------------------------------------------
@@ -1333,6 +1322,7 @@ udf_bg_scan_job_info(as_job* _job, as_mon_jobstat* stat)
 {
 	strcpy(stat->job_type, scan_type_str(SCAN_TYPE_UDF_BG));
 	stat->net_io_bytes = sizeof(cl_msg); // size of original synchronous fin
+	stat->socket_timeout = CF_SOCKET_TIMEOUT;
 
 	udf_bg_scan_job* job = (udf_bg_scan_job*)_job;
 	char* extra = stat->jdata + strlen(stat->jdata);

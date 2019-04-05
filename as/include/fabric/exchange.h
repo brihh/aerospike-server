@@ -38,6 +38,14 @@
  */
 
 /**
+ * Used by exchange listeners during upgrades for compatibility purposes.
+ *
+ * 1 - 4.5.1 - for SMD upgrade.
+ * 2 - 4.5.2 - for AER-6035 (AP uniform-balance + quiesce bug).
+ */
+#define AS_EXCHANGE_COMPATIBILITY_ID 2
+
+/**
  * Number of quantum intervals in orphan state after which client transactions
  * will be blocked.
  */
@@ -144,6 +152,18 @@ as_exchange_info_get_succession(cf_dyn_buf* db);
  */
 cf_node
 as_exchange_principal();
+
+/**
+ * Used by exchange listeners during upgrades for compatibility purposes.
+ */
+uint32_t*
+as_exchange_compatibility_ids(void);
+
+/**
+ * Used by exchange listeners during upgrades for compatibility purposes.
+ */
+uint32_t
+as_exchange_min_compatibility_id(void);
 
 /**
  * Output exchange cluster state for info.

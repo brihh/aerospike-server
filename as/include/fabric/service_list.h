@@ -1,7 +1,7 @@
 /*
- * udf_memtracker.h
+ * service_list.h
  *
- * Copyright (C) 2014 Aerospike, Inc.
+ * Copyright (C) 2017-2018 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -20,32 +20,22 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/
  */
 
-/**
- * An as_memtracker for tests.
- */
-
 #pragma once
 
+//==========================================================
+// Includes.
+//
+
 #include <stdint.h>
-#include "aerospike/as_memtracker.h"
 
-typedef enum {
-	MEM_RESERVE	= 0,
-	MEM_RELEASE	= 1,
-	MEM_RESET	= 2
-} memtracker_op;
+#include "dynbuf.h"
 
-typedef struct mem_tracker_s mem_tracker;
-typedef bool (*as_memtracker_op_cb)(mem_tracker *mt, uint32_t, memtracker_op);
 
-struct mem_tracker_s {
-	void					*udata;
-	as_memtracker_op_cb		cb;
-};
+//==========================================================
+// Public API.
+//
 
-/*****************************************************************************
- * STATIC FUNCTIONS
- *****************************************************************************/
-as_memtracker * udf_memtracker_init();
-void udf_memtracker_setup(mem_tracker *mt);
-void udf_memtracker_cleanup();
+void as_service_list_init(void);
+
+int32_t as_service_list_dynamic(char *key, cf_dyn_buf *db);
+int32_t as_service_list_command(char *key, char *par, cf_dyn_buf *db);

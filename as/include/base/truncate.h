@@ -26,13 +26,13 @@
 // Includes.
 //
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "citrusleaf/cf_atomic.h"
 
+#include "cf_mutex.h"
 #include "shash.h"
 
 
@@ -58,7 +58,7 @@ typedef struct as_truncate_s {
 	uint64_t lut;
 	cf_shash* startup_set_hash; // relevant only for enterprise edition
 	truncate_state state;
-	pthread_mutex_t state_lock;
+	cf_mutex state_lock;
 	cf_atomic32 n_threads_running;
 	cf_atomic32 pid;
 	cf_atomic64 n_records_this_run;
@@ -76,7 +76,7 @@ void as_truncate_list_cenotaphs(struct as_namespace_s* ns);
 bool as_truncate_lut_is_truncated(uint64_t rec_lut, struct as_namespace_s* ns, const char* set_name, uint32_t set_name_len);
 void as_truncate_done_startup(struct as_namespace_s* ns);
 bool as_truncate_cmd(const char* ns_name, const char* set_name, const char* lut_str);
-void as_truncate_undo_cmd(const char* ns_name, const char* set_name);
+bool as_truncate_undo_cmd(const char* ns_name, const char* set_name);
 bool as_truncate_now_is_truncated(struct as_namespace_s* ns, uint16_t set_id);
 bool as_truncate_record_is_truncated(const struct as_index_s* r, struct as_namespace_s* ns);
 

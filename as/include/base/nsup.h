@@ -1,7 +1,7 @@
 /*
- * meminfo.h
+ * nsup.h
  *
- * Copyright (C) 2010 Aerospike, Inc.
+ * Copyright (C) 2019 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -22,12 +22,30 @@
 
 #pragma once
 
+//==========================================================
+// Includes.
+//
+
 #include <stdbool.h>
 #include <stdint.h>
 
-/* SYNOPSIS
- * We have the ability to evict data to protect the server.
- */
 
-int
-cf_meminfo(uint64_t *physmem, uint64_t *freemem, int *freepct, bool *swapping);
+//==========================================================
+// Forward declarations.
+//
+
+struct as_namespace_s;
+
+
+//==========================================================
+// Public API.
+//
+
+void as_nsup_init(void);
+void as_nsup_start(void);
+
+bool as_nsup_handle_clock_skew(struct as_namespace_s* ns, uint64_t skew_ms);
+
+bool as_nsup_eviction_reset_cmd(const char* ns_name, const char* ttl_str);
+
+bool as_cold_start_evict_if_needed(struct as_namespace_s* ns);

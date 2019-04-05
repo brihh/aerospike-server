@@ -26,7 +26,6 @@
 
 #include "transaction/read.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -35,6 +34,7 @@
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_clock.h"
 
+#include "cf_mutex.h"
 #include "dynbuf.h"
 #include "fault.h"
 
@@ -95,17 +95,36 @@ static inline void
 client_read_update_stats(as_namespace* ns, uint8_t result_code)
 {
 	switch (result_code) {
-	case AS_PROTO_RESULT_OK:
+	case AS_OK:
 		cf_atomic64_incr(&ns->n_client_read_success);
 		break;
-	case AS_PROTO_RESULT_FAIL_TIMEOUT:
+	case AS_ERR_TIMEOUT:
 		cf_atomic64_incr(&ns->n_client_read_timeout);
 		break;
 	default:
 		cf_atomic64_incr(&ns->n_client_read_error);
 		break;
-	case AS_PROTO_RESULT_FAIL_NOT_FOUND:
+	case AS_ERR_NOT_FOUND:
 		cf_atomic64_incr(&ns->n_client_read_not_found);
+		break;
+	}
+}
+
+static inline void
+from_proxy_read_update_stats(as_namespace* ns, uint8_t result_code)
+{
+	switch (result_code) {
+	case AS_OK:
+		cf_atomic64_incr(&ns->n_from_proxy_read_success);
+		break;
+	case AS_ERR_TIMEOUT:
+		cf_atomic64_incr(&ns->n_from_proxy_read_timeout);
+		break;
+	default:
+		cf_atomic64_incr(&ns->n_from_proxy_read_error);
+		break;
+	case AS_ERR_NOT_FOUND:
+		cf_atomic64_incr(&ns->n_from_proxy_read_not_found);
 		break;
 	}
 }
@@ -114,17 +133,36 @@ static inline void
 batch_sub_read_update_stats(as_namespace* ns, uint8_t result_code)
 {
 	switch (result_code) {
-	case AS_PROTO_RESULT_OK:
+	case AS_OK:
 		cf_atomic64_incr(&ns->n_batch_sub_read_success);
 		break;
-	case AS_PROTO_RESULT_FAIL_TIMEOUT:
+	case AS_ERR_TIMEOUT:
 		cf_atomic64_incr(&ns->n_batch_sub_read_timeout);
 		break;
 	default:
 		cf_atomic64_incr(&ns->n_batch_sub_read_error);
 		break;
-	case AS_PROTO_RESULT_FAIL_NOT_FOUND:
+	case AS_ERR_NOT_FOUND:
 		cf_atomic64_incr(&ns->n_batch_sub_read_not_found);
+		break;
+	}
+}
+
+static inline void
+from_proxy_batch_sub_read_update_stats(as_namespace* ns, uint8_t result_code)
+{
+	switch (result_code) {
+	case AS_OK:
+		cf_atomic64_incr(&ns->n_from_proxy_batch_sub_read_success);
+		break;
+	case AS_ERR_TIMEOUT:
+		cf_atomic64_incr(&ns->n_from_proxy_batch_sub_read_timeout);
+		break;
+	default:
+		cf_atomic64_incr(&ns->n_from_proxy_batch_sub_read_error);
+		break;
+	case AS_ERR_NOT_FOUND:
+		cf_atomic64_incr(&ns->n_from_proxy_batch_sub_read_not_found);
 		break;
 	}
 }
@@ -189,7 +227,7 @@ as_read_start(as_transaction* tr)
 
 		if (insufficient_replica_destinations(tr->rsv.ns, rw->n_dest_nodes)) {
 			rw_request_hash_delete(&hkey, rw);
-			tr->result_code = AS_PROTO_RESULT_FAIL_UNAVAILABLE;
+			tr->result_code = AS_ERR_UNAVAILABLE;
 			send_read_response(tr, NULL, NULL, 0, NULL);
 			return TRANS_DONE_ERROR;
 		}
@@ -220,12 +258,12 @@ start_read_dup_res(rw_request* rw, as_transaction* tr)
 
 	dup_res_make_message(rw, tr);
 
-	pthread_mutex_lock(&rw->lock);
+	cf_mutex_lock(&rw->lock);
 
 	dup_res_setup_rw(rw, tr, read_dup_res_cb, read_timeout_cb);
 	send_rw_messages(rw);
 
-	pthread_mutex_unlock(&rw->lock);
+	cf_mutex_unlock(&rw->lock);
 }
 
 
@@ -236,12 +274,12 @@ start_repl_ping(rw_request* rw, as_transaction* tr)
 
 	repl_ping_make_message(rw, tr);
 
-	pthread_mutex_lock(&rw->lock);
+	cf_mutex_lock(&rw->lock);
 
 	repl_ping_setup_rw(rw, tr, repl_ping_cb, read_timeout_cb);
 	send_rw_messages(rw);
 
-	pthread_mutex_unlock(&rw->lock);
+	cf_mutex_unlock(&rw->lock);
 }
 
 
@@ -254,7 +292,7 @@ read_dup_res_cb(rw_request* rw)
 	as_transaction tr;
 	as_transaction_init_from_rw(&tr, rw);
 
-	if (tr.result_code != AS_PROTO_RESULT_OK) {
+	if (tr.result_code != AS_OK) {
 		send_read_response(&tr, NULL, NULL, 0, NULL);
 		return true;
 	}
@@ -265,7 +303,7 @@ read_dup_res_cb(rw_request* rw)
 				rw->dest_nodes);
 
 		if (insufficient_replica_destinations(tr.rsv.ns, rw->n_dest_nodes)) {
-			tr.result_code = AS_PROTO_RESULT_FAIL_UNAVAILABLE;
+			tr.result_code = AS_ERR_UNAVAILABLE;
 			send_read_response(&tr, NULL, NULL, 0, NULL);
 			return true;
 		}
@@ -367,6 +405,12 @@ send_read_response(as_transaction* tr, as_msg_op** ops, as_bin** response_bins,
 					tr->result_code, tr->generation, tr->void_time, ops,
 					response_bins, n_bins, tr->rsv.ns, as_transaction_trid(tr));
 		}
+		if (as_transaction_is_batch_sub(tr)) {
+			from_proxy_batch_sub_read_update_stats(tr->rsv.ns, tr->result_code);
+		}
+		else {
+			from_proxy_read_update_stats(tr->rsv.ns, tr->result_code);
+		}
 		break;
 	case FROM_BATCH:
 		BENCHMARK_NEXT_DATA_POINT(tr, batch_sub, read_local);
@@ -392,18 +436,24 @@ read_timeout_cb(rw_request* rw)
 
 	switch (rw->origin) {
 	case FROM_CLIENT:
-		as_msg_send_reply(rw->from.proto_fd_h, AS_PROTO_RESULT_FAIL_TIMEOUT, 0,
-				0, NULL, NULL, 0, rw->rsv.ns, rw_request_trid(rw));
+		as_msg_send_reply(rw->from.proto_fd_h, AS_ERR_TIMEOUT, 0, 0, NULL, NULL,
+				0, rw->rsv.ns, rw_request_trid(rw));
 		// Timeouts aren't included in histograms.
-		client_read_update_stats(rw->rsv.ns, AS_PROTO_RESULT_FAIL_TIMEOUT);
+		client_read_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT);
 		break;
 	case FROM_PROXY:
+		if (rw_request_is_batch_sub(rw)) {
+			from_proxy_batch_sub_read_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT);
+		}
+		else {
+			from_proxy_read_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT);
+		}
 		break;
 	case FROM_BATCH:
 		as_batch_add_error(rw->from.batch_shared, rw->from_data.batch_index,
-				AS_PROTO_RESULT_FAIL_TIMEOUT);
+				AS_ERR_TIMEOUT);
 		// Timeouts aren't included in histograms.
-		batch_sub_read_update_stats(rw->rsv.ns, AS_PROTO_RESULT_FAIL_TIMEOUT);
+		batch_sub_read_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT);
 		break;
 	default:
 		cf_crash(AS_RW, "unexpected transaction origin %u", rw->origin);
@@ -427,7 +477,7 @@ read_local(as_transaction* tr)
 	as_index_ref r_ref;
 
 	if (as_record_get(tr->rsv.tree, &tr->keyd, &r_ref) != 0) {
-		read_local_done(tr, NULL, NULL, AS_PROTO_RESULT_FAIL_NOT_FOUND);
+		read_local_done(tr, NULL, NULL, AS_ERR_NOT_FOUND);
 		return TRANS_DONE_ERROR;
 	}
 
@@ -435,13 +485,18 @@ read_local(as_transaction* tr)
 
 	// Check if it's an expired or truncated record.
 	if (as_record_is_doomed(r, ns)) {
-		read_local_done(tr, &r_ref, NULL, AS_PROTO_RESULT_FAIL_NOT_FOUND);
+		read_local_done(tr, &r_ref, NULL, AS_ERR_NOT_FOUND);
 		return TRANS_DONE_ERROR;
 	}
 
 	int result = repl_state_check(r, tr);
 
 	if (result != 0) {
+		if (result == -3) {
+			read_local_done(tr, &r_ref, NULL, AS_ERR_UNAVAILABLE);
+			return TRANS_DONE_ERROR;
+		}
+
 		// No response sent to origin.
 		as_record_done(&r_ref, ns);
 		return result == 1 ? TRANS_IN_PROGRESS : TRANS_WAITING;
@@ -449,7 +504,7 @@ read_local(as_transaction* tr)
 
 	// Check if it's a tombstone.
 	if (! as_record_is_live(r)) {
-		read_local_done(tr, &r_ref, NULL, AS_PROTO_RESULT_FAIL_NOT_FOUND);
+		read_local_done(tr, &r_ref, NULL, AS_ERR_NOT_FOUND);
 		return TRANS_DONE_ERROR;
 	}
 
@@ -457,11 +512,14 @@ read_local(as_transaction* tr)
 
 	as_storage_record_open(ns, r, &rd);
 
+	// If configuration permits, allow reads to use page cache.
+	rd.read_page_cache = ns->storage_read_page_cache;
+
 	// Check the key if required.
 	// Note - for data-not-in-memory "exists" ops, key check is expensive!
 	if (as_transaction_has_key(tr) &&
 			as_storage_record_get_key(&rd) && ! check_msg_key(m, &rd)) {
-		read_local_done(tr, &r_ref, &rd, AS_PROTO_RESULT_FAIL_KEY_MISMATCH);
+		read_local_done(tr, &r_ref, &rd, AS_ERR_KEY_MISMATCH);
 		return TRANS_DONE_ERROR;
 	}
 
@@ -470,7 +528,7 @@ read_local(as_transaction* tr)
 		tr->void_time = r->void_time;
 		tr->last_update_time = r->last_update_time;
 
-		read_local_done(tr, &r_ref, &rd, AS_PROTO_RESULT_OK);
+		read_local_done(tr, &r_ref, &rd, AS_OK);
 		return TRANS_DONE_SUCCESS;
 	}
 
@@ -490,7 +548,7 @@ read_local(as_transaction* tr)
 
 	if (! as_bin_inuse_has(&rd)) {
 		cf_warning_digest(AS_RW, &tr->keyd, "{%s} read_local: found record with no bins ", ns->name);
-		read_local_done(tr, &r_ref, &rd, AS_PROTO_RESULT_FAIL_UNKNOWN);
+		read_local_done(tr, &r_ref, &rd, AS_ERR_UNKNOWN);
 		return TRANS_DONE_ERROR;
 	}
 
@@ -513,7 +571,7 @@ read_local(as_transaction* tr)
 	else {
 		if (m->n_ops == 0) {
 			cf_warning_digest(AS_RW, &tr->keyd, "{%s} read_local: bin op(s) expected, none present ", ns->name);
-			read_local_done(tr, &r_ref, &rd, AS_PROTO_RESULT_FAIL_PARAMETER);
+			read_local_done(tr, &r_ref, &rd, AS_ERR_PARAMETER);
 			return TRANS_DONE_ERROR;
 		}
 
@@ -563,7 +621,7 @@ read_local(as_transaction* tr)
 			else {
 				cf_warning_digest(AS_RW, &tr->keyd, "{%s} read_local: unexpected bin op %u ", ns->name, op->op);
 				destroy_stack_bins(result_bins, n_result_bins);
-				read_local_done(tr, &r_ref, &rd, AS_PROTO_RESULT_FAIL_PARAMETER);
+				read_local_done(tr, &r_ref, &rd, AS_ERR_PARAMETER);
 				return TRANS_DONE_ERROR;
 			}
 		}

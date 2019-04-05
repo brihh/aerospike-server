@@ -26,7 +26,6 @@
 
 #include "fabric/migrate.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -41,6 +40,8 @@
 #include "citrusleaf/cf_digest.h"
 #include "citrusleaf/cf_queue.h"
 
+#include "cf_mutex.h"
+#include "cf_thread.h"
 #include "fault.h"
 #include "msg.h"
 #include "node.h"
@@ -50,6 +51,7 @@
 #include "base/cfg.h"
 #include "base/datamodel.h"
 #include "base/index.h"
+#include "base/proto.h"
 #include "fabric/exchange.h"
 #include "fabric/fabric.h"
 #include "fabric/meta_batch.h"
@@ -131,6 +133,7 @@ typedef enum {
 typedef struct emigration_pop_info_s {
 	uint32_t order;
 	uint64_t dest_score;
+	uint32_t type;
 	uint64_t n_elements;
 
 	uint64_t avoid_dest;
@@ -149,10 +152,10 @@ typedef struct emigration_reinsert_ctrl_s {
 
 cf_rchash *g_emigration_hash = NULL;
 cf_rchash *g_immigration_hash = NULL;
+cf_queue g_emigration_q;
 
 static uint64_t g_avoid_dest = 0;
 static cf_atomic32 g_emigration_id = 0;
-static cf_queue g_emigration_q;
 static cf_queue g_emigration_slow_q;
 
 
@@ -224,26 +227,14 @@ as_migrate_init()
 			CF_RCHASH_BIG_LOCK);
 
 	// Looks like an as_priority_thread_pool, but the reduce-pop is different.
-
-	pthread_t thread;
-	pthread_attr_t attrs;
-
-	pthread_attr_init(&attrs);
-	pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
-
 	for (uint32_t i = 0; i < g_config.n_migrate_threads; i++) {
-		if (pthread_create(&thread, &attrs, run_emigration, NULL) != 0) {
-			cf_crash(AS_MIGRATE, "failed to create emigration thread");
-		}
+		cf_thread_create_detached(run_emigration, NULL);
 	}
 
-	if (pthread_create(&thread, &attrs, run_emigration_slow, NULL) != 0) {
-		cf_crash(AS_MIGRATE, "failed to create emigration slow thread");
-	}
+	cf_thread_create_detached(run_emigration_slow, NULL);
+	cf_thread_create_detached(run_immigration_reaper, NULL);
 
-	if (pthread_create(&thread, &attrs, run_immigration_reaper, NULL) != 0) {
-		cf_crash(AS_MIGRATE, "failed to create immigration reaper thread");
-	}
+	emigrate_fill_queue_init();
 
 	as_fabric_register_msg_fn(M_TYPE_MIGRATE, migrate_mt, sizeof(migrate_mt),
 			MIG_MSG_SCRATCH_SIZE, migrate_receive_msg_cb, NULL);
@@ -277,7 +268,7 @@ as_migrate_emigrate(const pb_task *task)
 
 	cf_atomic_int_incr(&emig->rsv.ns->migrate_tx_instance_count);
 
-	cf_queue_push(&g_emigration_q, &emig);
+	emigrate_queue_push(emig);
 }
 
 
@@ -297,18 +288,8 @@ as_migrate_set_num_xmit_threads(uint32_t n_threads)
 	}
 	else {
 		// Increase the number of migrate transmit threads to n_threads.
-		pthread_t thread;
-		pthread_attr_t attrs;
-
-		pthread_attr_init(&attrs);
-		pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
-
 		while (g_config.n_migrate_threads < n_threads) {
-			if (pthread_create(&thread, &attrs, run_emigration, NULL) != 0) {
-				cf_warning(AS_MIGRATE, "failed to create emigration thread");
-				return;
-			}
-
+			cf_thread_create_detached(run_emigration, NULL);
 			g_config.n_migrate_threads++;
 		}
 	}
@@ -537,6 +518,7 @@ emigration_pop(emigration **emigp)
 
 	best.order = 0xFFFFffff;
 	best.dest_score = 0;
+	best.type = 0;
 	best.n_elements = 0xFFFFffffFFFFffff;
 
 	best.avoid_dest = 0;
@@ -577,15 +559,20 @@ emigration_pop_reduce_fn(void *buf, void *udata)
 
 	uint32_t order = emig->rsv.ns->migrate_order;
 	uint64_t dest_score = (uint64_t)emig->dest - best->avoid_dest;
+	uint32_t type = (emig->tx_flags & TX_FLAGS_LEAD) != 0 ?
+			2 : ((emig->tx_flags & TX_FLAGS_CONTINGENT) != 0 ? 1 : 0);
 	uint64_t n_elements = as_index_tree_size(emig->rsv.tree);
 
 	if (order < best->order ||
 			(order == best->order &&
-					(dest_score > best->dest_score ||
-							(dest_score == best->dest_score &&
-									n_elements < best->n_elements)))) {
+				(dest_score > best->dest_score ||
+					(dest_score == best->dest_score &&
+						(type > best->type ||
+							(type == best->type &&
+								n_elements < best->n_elements)))))) {
 		best->order = order;
 		best->dest_score = dest_score;
+		best->type = type;
 		best->n_elements = n_elements;
 
 		g_avoid_dest = (uint64_t)emig->dest;
@@ -708,7 +695,8 @@ emigrate_signal(emigration *emig)
 				CF_QUEUE_OK) {
 			switch (op) {
 			case OPERATION_ALL_DONE_ACK:
-				cf_atomic_int_decr(&ns->migrate_signals_remaining);
+				as_partition_signal_done(ns, emig->rsv.p->id,
+						emig->cluster_key);
 				as_fabric_msg_put(m);
 				return;
 			default:
@@ -792,18 +780,15 @@ emigrate_tree(emigration *emig)
 
 	cf_atomic32_set(&emig->state, EMIG_STATE_ACTIVE);
 
-	pthread_t thread;
-
-	if (pthread_create(&thread, NULL, run_emigration_reinserter, emig) != 0) {
-		cf_crash(AS_MIGRATE, "could not start reinserter thread");
-	}
+	cf_tid tid = cf_thread_create_joinable(run_emigration_reinserter,
+			(void*)emig);
 
 	as_index_reduce(emig->rsv.tree, emigrate_tree_reduce_fn, emig);
 
 	// Sets EMIG_STATE_FINISHED only if not already EMIG_STATE_ABORTED.
 	cf_atomic32_setmax(&emig->state, EMIG_STATE_FINISHED);
 
-	pthread_join(thread, NULL);
+	cf_thread_join(tid);
 
 	return emig->state != EMIG_STATE_ABORTED;
 }
@@ -1441,10 +1426,9 @@ immigration_handle_insert_request(cf_node src, msg *m)
 		int rv = as_record_replace_if_better(&rr, false, false, false);
 
 		// If replace failed, don't ack - it will be retransmitted.
-		if (! (rv == AS_PROTO_RESULT_OK ||
+		if (! (rv == AS_OK ||
 				// Migrations just treat these errors as successful no-ops:
-				rv == AS_PROTO_RESULT_FAIL_RECORD_EXISTS ||
-				rv == AS_PROTO_RESULT_FAIL_GENERATION)) {
+				rv == AS_ERR_RECORD_EXISTS || rv == AS_ERR_GENERATION)) {
 			immigration_release(immig);
 			as_fabric_msg_put(m);
 			return;
@@ -1519,7 +1503,6 @@ immigration_handle_done_request(cf_node src, msg *m)
 
 	if (as_fabric_send(src, m, AS_FABRIC_CHANNEL_CTRL) != AS_FABRIC_SUCCESS) {
 		as_fabric_msg_put(m);
-		return;
 	}
 }
 
@@ -1584,7 +1567,6 @@ immigration_handle_all_done_request(cf_node src, msg *m)
 
 	if (as_fabric_send(src, m, AS_FABRIC_CHANNEL_CTRL) != AS_FABRIC_SUCCESS) {
 		as_fabric_msg_put(m);
-		return;
 	}
 }
 
@@ -1623,7 +1605,7 @@ emigration_handle_insert_ack(cf_node src, msg *m)
 	}
 
 	emigration_reinsert_ctrl *ri_ctrl = NULL;
-	pthread_mutex_t *vlock;
+	cf_mutex *vlock;
 
 	if (cf_shash_get_vlock(emig->reinsert_hash, &insert_id, (void **)&ri_ctrl,
 			&vlock) == CF_SHASH_OK) {
@@ -1642,7 +1624,7 @@ emigration_handle_insert_ack(cf_node src, msg *m)
 			cf_warning(AS_MIGRATE, "insert ack: unexpected source %lx", src);
 		}
 
-		pthread_mutex_unlock(vlock);
+		cf_mutex_unlock(vlock);
 	}
 
 	emigration_release(emig);

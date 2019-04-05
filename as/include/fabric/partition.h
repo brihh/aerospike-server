@@ -49,6 +49,7 @@
 
 struct as_index_tree_s;
 struct as_namespace_s;
+struct as_transaction_s;
 
 
 //==========================================================
@@ -118,20 +119,28 @@ typedef struct as_partition_s {
 	as_partition_version final_version;
 	as_partition_version version;
 
-	int pending_emigrations;
-	int pending_immigrations;
+	uint16_t pending_emigrations;
+	uint16_t pending_lead_emigrations;
+	uint16_t pending_immigrations;
 
-	uint32_t n_witnesses;
+	uint16_t n_witnesses;
 
-	// @ 48 bytes - room for 2 duplicates within above 64-byte cache line.
+	// @ 40 bytes - room for 3 duplicates within above 64-byte cache line.
 	cf_node dupls[AS_CLUSTER_SZ];
 
-	uint8_t align_2[16];
+	uint8_t align_2[24];
 	// @ 64-byte-aligned boundary.
 
 	bool immigrators[AS_CLUSTER_SZ];
+	// Byte alignment depends on AS_CLUSTER_SZ - pad below to realign.
+
+	uint8_t align_3[AS_CLUSTER_SZ == 8 ? 56 : 0];
+	// @ 64-byte-aligned boundary.
+
 	cf_node witnesses[AS_CLUSTER_SZ];
 } as_partition;
+
+COMPILER_ASSERT(sizeof(as_partition) % 64 == 0);
 
 typedef struct as_partition_reservation_s {
 	struct as_namespace_s* ns;
@@ -184,7 +193,6 @@ uint32_t as_partition_get_other_replicas(as_partition* p, cf_node* nv);
 cf_node as_partition_writable_node(struct as_namespace_s* ns, uint32_t pid);
 cf_node as_partition_proxyee_redirect(struct as_namespace_s* ns, uint32_t pid);
 
-void as_partition_get_replicas_prole_str(cf_dyn_buf* db); // deprecate in "six months"
 void as_partition_get_replicas_master_str(cf_dyn_buf* db);
 void as_partition_get_replicas_all_str(cf_dyn_buf* db, bool include_regime);
 
@@ -193,7 +201,7 @@ void as_partition_get_replica_stats(struct as_namespace_s* ns, repl_stats* p_sta
 void as_partition_reserve(struct as_namespace_s* ns, uint32_t pid, as_partition_reservation* rsv);
 int as_partition_reserve_replica(struct as_namespace_s* ns, uint32_t pid, as_partition_reservation* rsv);
 int as_partition_reserve_write(struct as_namespace_s* ns, uint32_t pid, as_partition_reservation* rsv, cf_node* node);
-int as_partition_reserve_read(struct as_namespace_s* ns, uint32_t pid, as_partition_reservation* rsv, bool would_dup_res, cf_node* node);
+int as_partition_reserve_read_tr(struct as_namespace_s* ns, uint32_t pid, struct as_transaction_s* tr, cf_node* node);
 int as_partition_prereserve_query(struct as_namespace_s* ns, bool can_partition_query[], as_partition_reservation rsv[]);
 int as_partition_reserve_query(struct as_namespace_s* ns, uint32_t pid, as_partition_reservation* rsv);
 int as_partition_reserve_xdr_read(struct as_namespace_s* ns, uint32_t pid, as_partition_reservation* rsv);
@@ -298,4 +306,5 @@ bool client_replica_maps_is_partition_queryable(const struct as_namespace_s* ns,
 // Private API - for enterprise separation only.
 //
 
-bool partition_reserve_promote(const struct as_namespace_s* ns, const as_partition* p, bool would_dup_res);
+int partition_reserve_unavailable(const struct as_namespace_s* ns, const as_partition* p, struct as_transaction_s* tr, cf_node* node);
+bool partition_reserve_promote(const struct as_namespace_s* ns, const as_partition* p, struct as_transaction_s* tr);

@@ -1,7 +1,7 @@
 /*
  * security_stubs.c
  *
- * Copyright (C) 2014 Aerospike, Inc.
+ * Copyright (C) 2014-2018 Aerospike, Inc.
  *
  * Portions may be licensed to Aerospike, Inc. under one or more contributor
  * license agreements.
@@ -39,6 +39,7 @@
 #include "fault.h"
 #include "socket.h"
 
+#include "base/datamodel.h"
 #include "base/proto.h"
 #include "base/transaction.h"
 
@@ -49,7 +50,7 @@
 
 // Security is an enterprise feature - here, do nothing.
 void
-as_security_init()
+as_security_init(void)
 {
 }
 
@@ -57,7 +58,7 @@ as_security_init()
 uint8_t
 as_security_check(const as_file_handle* fd_h, as_sec_perm perm)
 {
-	return AS_PROTO_RESULT_OK;
+	return AS_OK;
 }
 
 // Security is an enterprise feature - here, allow all operations.
@@ -70,7 +71,7 @@ as_security_check_data_op(as_transaction* tr, as_namespace* ns,
 
 // Security is an enterprise feature - here, there's no filter.
 void*
-as_security_filter_create()
+as_security_filter_create(void)
 {
 	return NULL;
 }
@@ -88,10 +89,18 @@ as_security_log(const as_file_handle* fd_h, uint8_t result, as_sec_perm perm,
 {
 }
 
-// Security is an enterprise feature - here, do nothing.
+// Security is an enterprise feature - here, never need to refresh.
+bool
+as_security_should_refresh(void)
+{
+	return false;
+}
+
+// Security is an enterprise feature - shouldn't get here.
 void
 as_security_refresh(as_file_handle* fd_h)
 {
+	cf_crash(AS_SECURITY, "CE build called as_security_refresh()");
 }
 
 // Security is an enterprise feature. If we receive a security message from a

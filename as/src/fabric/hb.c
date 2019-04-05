@@ -37,12 +37,15 @@
 #include "citrusleaf/cf_hash_math.h"
 #include "citrusleaf/cf_queue.h"
 
+#include "cf_thread.h"
+#include "dns.h"
 #include "fault.h"
 #include "node.h"
 #include "shash.h"
 #include "socket.h"
 
 #include "base/cfg.h"
+#include "base/health.h"
 #include "base/stats.h"
 #include "base/thr_info.h"
 #include "fabric/endpoint.h"
@@ -1381,6 +1384,16 @@ typedef struct as_hb_mesh_tip_clear_udata_s
 	int port;
 
 	/**
+	 * Number of IP addresses to match.
+	 */
+	uint32_t n_addrs;
+
+	/**
+	 * IP addresses to match.
+ 	*/
+	cf_ip_addr* addrs;
+
+	/**
 	 * Node id if a specific node-id needs to be removed as well.
 	 */
 	cf_node nodeid;
@@ -2305,11 +2318,21 @@ as_hb_mesh_tip_clear(char* host, int port)
 	// We should not be required to use this mechanism now.
 	// tip-clear should only be used to cleanup seed list after decommisioning
 	// an ip.
+	cf_ip_addr addrs[CF_SOCK_CFG_MAX];
+	uint32_t n_addrs = CF_SOCK_CFG_MAX;
+
 	as_hb_mesh_tip_clear_udata mesh_tip_clear_reduce_udata;
-	strncpy(mesh_tip_clear_reduce_udata.host, host, DNS_NAME_MAX_SIZE);
+	strcpy(mesh_tip_clear_reduce_udata.host, host);
 	mesh_tip_clear_reduce_udata.port = port;
 	mesh_tip_clear_reduce_udata.entry_deleted = false;
 	mesh_tip_clear_reduce_udata.nodeid = 0;
+
+	if (cf_ip_addr_from_string_multi(host, addrs, &n_addrs) != 0) {
+		n_addrs = 0;
+	}
+
+	mesh_tip_clear_reduce_udata.addrs = addrs;
+	mesh_tip_clear_reduce_udata.n_addrs = n_addrs;
 
 	int seed_index = mesh_seed_find_unsafe(host, port);
 	if (seed_index >= 0) {
@@ -2884,7 +2907,7 @@ msg_type_get(msg* msg, as_hb_msg_type* type)
 static int
 msg_cluster_name_get(msg* msg, char** cluster_name)
 {
-	if (msg_get_str(msg, AS_HB_MSG_CLUSTER_NAME, cluster_name, NULL,
+	if (msg_get_str(msg, AS_HB_MSG_CLUSTER_NAME, cluster_name,
 			MSG_GET_DIRECT) != 0) {
 		return -1;
 	}
@@ -5027,10 +5050,8 @@ channel_start()
 	channel_events_enabled_set(true);
 
 	// Start the channel tender.
-	if (pthread_create(&g_hb.channel_state.channel_tender_tid, 0,
-			channel_tender, &g_hb) != 0) {
-		CRASH("could not create channel tender thread: %s", cf_strerror(errno));
-	}
+	g_hb.channel_state.channel_tender_tid =
+			cf_thread_create_joinable(channel_tender, (void*)&g_hb);
 
 Exit:
 	CHANNEL_UNLOCK();
@@ -5064,7 +5085,7 @@ channel_stop()
 	g_hb.channel_state.status = AS_HB_STATUS_SHUTTING_DOWN;
 
 	// Wait for the channel tender thread to finish.
-	pthread_join(g_hb.channel_state.channel_tender_tid, NULL);
+	cf_thread_join(g_hb.channel_state.channel_tender_tid);
 
 	CHANNEL_LOCK();
 
@@ -5579,6 +5600,48 @@ mesh_seed_destroy(as_hb_mesh_seed* seed)
 	MESH_UNLOCK();
 }
 
+static void
+mesh_seed_dns_resolve_cb(bool is_resolved, const char* hostname,
+		const cf_ip_addr *addrs, uint32_t n_addrs, void *udata)
+{
+	MESH_LOCK();
+	cf_vector* seeds = &g_hb.mode_state.mesh_state.seeds;
+	int element_count = cf_vector_size(seeds);
+	for (int i = 0; i < element_count; i++) {
+		as_hb_mesh_seed* seed = cf_vector_getp(seeds, i);
+
+		if ((strncmp(seed->seed_host_name, hostname,
+				sizeof(seed->seed_host_name)) != 0)
+				|| seed->resolved_endpoint_list != NULL) {
+			continue;
+		}
+
+		cf_serv_cfg temp_serv_cfg;
+		cf_serv_cfg_init(&temp_serv_cfg);
+
+		cf_sock_cfg sock_cfg;
+		cf_sock_cfg_init(&sock_cfg,
+				seed->seed_tls ?
+						CF_SOCK_OWNER_HEARTBEAT_TLS : CF_SOCK_OWNER_HEARTBEAT);
+		sock_cfg.port = seed->seed_port;
+
+		for (int i = 0; i < n_addrs; i++) {
+			cf_ip_addr_copy(&addrs[i], &sock_cfg.addr);
+			if (cf_serv_cfg_add_sock_cfg(&temp_serv_cfg, &sock_cfg)) {
+				CRASH("error initializing resolved address list");
+			}
+
+			DETAIL("resolved mesh node hostname %s to %s", seed->seed_host_name,
+					cf_ip_addr_print(&addrs[i]));
+		}
+
+		seed->resolved_endpoint_list = as_endpoint_list_from_serv_cfg(
+				&temp_serv_cfg);
+	}
+
+	MESH_UNLOCK();
+}
+
 /**
  * Fill the endpoint list for a mesh seed using the mesh seed hostname and port.
  * returns the
@@ -5604,43 +5667,11 @@ mesh_seed_endpoint_list_fill(as_hb_mesh_seed* seed)
 		return -1;
 	}
 
-	uint32_t n_resolved_addresses = CF_SOCK_CFG_MAX;
-	cf_ip_addr resolved_addresses[n_resolved_addresses];
-
-	// Resolve and get all IPv4/IPv6 ip addresses.
+	// Resolve and get all IPv4/IPv6 ip addresses asynchronously.
 	seed->resolved_endpoint_list_ts = now;
-	if (cf_ip_addr_from_string_multi(seed->seed_host_name, resolved_addresses,
-			&n_resolved_addresses) != 0 || n_resolved_addresses == 0) {
-		TICKER_WARNING("failed resolving mesh seed hostname %s",
-				seed->seed_host_name);
-
-		// Hostname resolution failed.
-		return -1;
-	}
-
-	// Convert resolved addresses to an endpoint list.
-	cf_serv_cfg temp_serv_cfg;
-	cf_serv_cfg_init(&temp_serv_cfg);
-
-	cf_sock_cfg sock_cfg;
-	cf_sock_cfg_init(&sock_cfg,
-			seed->seed_tls ?
-					CF_SOCK_OWNER_HEARTBEAT_TLS : CF_SOCK_OWNER_HEARTBEAT);
-	sock_cfg.port = seed->seed_port;
-
-	for (int i = 0; i < n_resolved_addresses; i++) {
-		cf_ip_addr_copy(&resolved_addresses[i], &sock_cfg.addr);
-		if (cf_serv_cfg_add_sock_cfg(&temp_serv_cfg, &sock_cfg)) {
-			CRASH("error initializing resolved address list");
-		}
-
-		DETAIL("resolved mesh node hostname %s to %s", seed->seed_host_name,
-				cf_ip_addr_print(&resolved_addresses[i]));
-	}
-
-	seed->resolved_endpoint_list = as_endpoint_list_from_serv_cfg(
-			&temp_serv_cfg);
-	return seed->resolved_endpoint_list != NULL ? 0 : -1;
+	cf_ip_addr_from_string_multi_a(seed->seed_host_name,
+			mesh_seed_dns_resolve_cb, NULL);
+	return -1;
 }
 
 /**
@@ -6766,7 +6797,7 @@ mesh_tip(char* host, int port, bool tls)
 	}
 
 	mesh_seed_status_change(&new_seed, AS_HB_MESH_NODE_CHANNEL_INACTIVE);
-	strncpy(new_seed.seed_host_name, host, sizeof(new_seed.seed_host_name));
+	strcpy(new_seed.seed_host_name, host);
 	new_seed.seed_port = port;
 	new_seed.seed_tls = tls;
 
@@ -6875,31 +6906,25 @@ mesh_tip_clear_reduce(const void* key, void* data, void* udata)
 
 	// See if the address matches any one of the endpoints in the node's
 	// endpoint list.
-	cf_ip_addr addrs[CF_SOCK_CFG_MAX];
-	uint32_t n_addrs = CF_SOCK_CFG_MAX;
+	for (int i = 0; i < tip_clear_udata->n_addrs; i++) {
+		cf_sock_addr sock_addr;
+		cf_ip_addr_copy(&tip_clear_udata->addrs[i], &sock_addr.addr);
+		sock_addr.port = tip_clear_udata->port;
+		as_hb_endpoint_list_addr_find_udata udata;
+		udata.found = false;
+		udata.to_search = &sock_addr;
 
-	if (cf_ip_addr_from_string_multi(tip_clear_udata->host, addrs, &n_addrs)
-			== 0) {
-		for (int i = 0; i < n_addrs; i++) {
-			cf_sock_addr sock_addr;
-			cf_ip_addr_copy(&addrs[i], &sock_addr.addr);
-			sock_addr.port = tip_clear_udata->port;
-			as_hb_endpoint_list_addr_find_udata udata;
-			udata.found = false;
-			udata.to_search = &sock_addr;
+		as_endpoint_list_iterate(mesh_node->endpoint_list,
+				mesh_endpoint_addr_find_iterate, &udata);
 
-			as_endpoint_list_iterate(mesh_node->endpoint_list,
-					mesh_endpoint_addr_find_iterate, &udata);
-
-			if (udata.found) {
-				rv = CF_SHASH_REDUCE_DELETE;
-				goto Exit;
-			}
+		if (udata.found) {
+			rv = CF_SHASH_REDUCE_DELETE;
+			goto Exit;
 		}
-
-		// Not found by endpoint.
-		rv = CF_SHASH_OK;
 	}
+
+	// Not found by endpoint.
+	rv = CF_SHASH_OK;
 
 Exit:
 	if (rv == CF_SHASH_REDUCE_DELETE) {
@@ -7067,10 +7092,8 @@ mesh_start()
 	g_hb.mode_state.mesh_state.status = AS_HB_STATUS_RUNNING;
 
 	// Start the mesh tender thread.
-	if (pthread_create(&g_hb.mode_state.mesh_state.mesh_tender_tid, 0,
-			mesh_tender, &g_hb) != 0) {
-		CRASH("could not create channel tender thread: %s", cf_strerror(errno));
-	}
+	g_hb.mode_state.mesh_state.mesh_tender_tid =
+			cf_thread_create_joinable(mesh_tender, (void*)&g_hb);
 
 	MESH_UNLOCK();
 }
@@ -7090,7 +7113,7 @@ mesh_stop()
 	g_hb.mode_state.mesh_state.status = AS_HB_STATUS_SHUTTING_DOWN;
 
 	// Wait for the channel tender thread to finish.
-	pthread_join(g_hb.mode_state.mesh_state.mesh_tender_tid, NULL);
+	cf_thread_join(g_hb.mode_state.mesh_state.mesh_tender_tid);
 
 	MESH_LOCK();
 
@@ -7477,6 +7500,7 @@ hb_event_queue(as_hb_internal_event_type event_type, const cf_node* nodes,
 		case AS_HB_INTERNAL_NODE_ARRIVE:
 			event.evt = AS_HB_NODE_ARRIVE;
 			event.event_time = event.event_detected_time;
+			as_health_add_node_counter(event.nodeid, AS_HEALTH_NODE_ARRIVALS);
 			break;
 		case AS_HB_INTERNAL_NODE_DEPART:
 			event.evt = AS_HB_NODE_DEPART;
@@ -8163,10 +8187,8 @@ static void
 hb_tx_start()
 {
 	// Start the transmitter thread.
-	if (pthread_create(&g_hb.transmitter_tid, 0, hb_transmitter, &g_hb) != 0) {
-		CRASH("could not create heartbeat transmitter thread: %s",
-				cf_strerror(errno));
-	}
+	g_hb.transmitter_tid = cf_thread_create_joinable(hb_transmitter,
+			(void*)&g_hb);
 }
 
 /**
@@ -8177,7 +8199,7 @@ hb_tx_stop()
 {
 	DETAIL("waiting for the transmitter thread to stop");
 	// Wait for the adjacency tender thread to stop.
-	pthread_join(g_hb.transmitter_tid, NULL);
+	cf_thread_join(g_hb.transmitter_tid);
 }
 
 /**
@@ -8187,11 +8209,8 @@ static void
 hb_adjacency_tender_start()
 {
 	// Start the transmitter thread.
-	if (pthread_create(&g_hb.adjacency_tender_tid, 0, hb_adjacency_tender,
-			&g_hb) != 0) {
-		CRASH("could not create heartbeat adjacency tender thread: %s",
-				cf_strerror(errno));
-	}
+	g_hb.adjacency_tender_tid = cf_thread_create_joinable(hb_adjacency_tender,
+			(void*)&g_hb);
 }
 
 /**
@@ -8201,7 +8220,7 @@ static void
 hb_adjacency_tender_stop()
 {
 	// Wait for the adjacency tender thread to stop.
-	pthread_join(g_hb.adjacency_tender_tid, NULL);
+	cf_thread_join(g_hb.adjacency_tender_tid);
 }
 
 /**

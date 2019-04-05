@@ -28,7 +28,6 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <malloc.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -45,7 +44,6 @@
 #include <sys/types.h>
 
 #include "fault.h"
-#include "mem_count.h"
 
 #include "aerospike/ck/ck_pr.h"
 #include "citrusleaf/cf_atomic.h"
