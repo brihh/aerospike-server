@@ -44,8 +44,8 @@
 #include "base/proto.h"
 #include "base/scan.h"
 #include "base/security.h"
+#include "base/service.h"
 #include "base/stats.h"
-#include "base/thr_demarshal.h"
 #include "fabric/partition.h"
 #include "transaction/proxy.h"
 #include "transaction/rw_request.h"
@@ -77,7 +77,7 @@ as_transaction_init_body(as_transaction *tr)
 	AS_PARTITION_RESERVATION_INIT(tr->rsv);
 
 	tr->end_time			= 0;
-	tr->result_code			= AS_PROTO_RESULT_OK;
+	tr->result_code			= AS_OK;
 	tr->flags				= 0;
 	tr->generation			= 0;
 	tr->void_time			= 0;
@@ -313,7 +313,7 @@ as_transaction_demarshal_error(as_transaction* tr, uint32_t error_code)
 
 #define UPDATE_ERROR_STATS(name) \
 	if (ns) { \
-		if (error_code == AS_PROTO_RESULT_FAIL_TIMEOUT) { \
+		if (error_code == AS_ERR_TIMEOUT) { \
 			cf_atomic64_incr(&ns->n_##name##_tsvc_timeout); \
 		} \
 		else { \
@@ -329,7 +329,7 @@ as_transaction_error(as_transaction* tr, as_namespace* ns, uint32_t error_code)
 {
 	if (error_code == 0) {
 		cf_warning(AS_PROTO, "converting error code 0 to 1 (unknown)");
-		error_code = AS_PROTO_RESULT_FAIL_UNKNOWN;
+		error_code = AS_ERR_UNKNOWN;
 	}
 
 	// The 'from' checks below are unnecessary, only paranoia.
@@ -346,6 +346,12 @@ as_transaction_error(as_transaction* tr, as_namespace* ns, uint32_t error_code)
 			as_proxy_send_response(tr->from.proxy_node, tr->from_data.proxy_tid, error_code, 0, 0, NULL, NULL, 0, NULL, as_transaction_trid(tr));
 			tr->from.proxy_node = 0; // pattern, not needed
 		}
+		if (as_transaction_is_batch_sub(tr)) {
+			UPDATE_ERROR_STATS(from_proxy_batch_sub);
+		}
+		else {
+			UPDATE_ERROR_STATS(from_proxy);
+		}
 		break;
 	case FROM_BATCH:
 		if (tr->from.batch_shared) {
@@ -361,8 +367,6 @@ as_transaction_error(as_transaction* tr, as_namespace* ns, uint32_t error_code)
 			tr->from.iudf_orig = NULL; // pattern, not needed
 		}
 		UPDATE_ERROR_STATS(udf_sub);
-		break;
-	case FROM_NSUP:
 		break;
 	case FROM_RE_REPL:
 		if (tr->from.re_repl_orig_cb) {
@@ -385,7 +389,7 @@ as_multi_rec_transaction_error(as_transaction* tr, uint32_t error_code)
 {
 	if (error_code == 0) {
 		cf_warning(AS_PROTO, "converting error code 0 to 1 (unknown)");
-		error_code = AS_PROTO_RESULT_FAIL_UNKNOWN;
+		error_code = AS_ERR_UNKNOWN;
 	}
 
 	switch (tr->origin) {
@@ -406,35 +410,19 @@ as_multi_rec_transaction_error(as_transaction* tr, uint32_t error_code)
 void
 as_release_file_handle(as_file_handle *proto_fd_h)
 {
-	int rc = cf_rc_release(proto_fd_h);
-
-	if (rc > 0) {
-		return;
-	}
-	else if (rc < 0) {
-		cf_warning(AS_PROTO, "release file handle: negative ref-count %d", rc);
+	if (cf_rc_release(proto_fd_h) != 0) {
 		return;
 	}
 
 	cf_socket_close(&proto_fd_h->sock);
 	cf_socket_term(&proto_fd_h->sock);
-	proto_fd_h->fh_info &= ~FH_INFO_DONOT_REAP;
 
-	if (proto_fd_h->proto)	{
-		as_proto *p = proto_fd_h->proto;
-
-		if ((p->version != PROTO_VERSION) || (p->type >= PROTO_TYPE_MAX)) {
-			cf_warning(AS_PROTO, "release file handle: bad proto buf, corruption");
-		}
-		else {
-			cf_free(proto_fd_h->proto);
-			proto_fd_h->proto = NULL;
-		}
+	if (proto_fd_h->proto != NULL) {
+		cf_free(proto_fd_h->proto);
 	}
 
-	if (proto_fd_h->security_filter) {
+	if (proto_fd_h->security_filter != NULL) {
 		as_security_filter_destroy(proto_fd_h->security_filter);
-		proto_fd_h->security_filter = NULL;
 	}
 
 	cf_rc_free(proto_fd_h);
@@ -444,13 +432,11 @@ as_release_file_handle(as_file_handle *proto_fd_h)
 void
 as_end_of_transaction(as_file_handle *proto_fd_h, bool force_close)
 {
-	thr_demarshal_rearm(proto_fd_h);
-
 	if (force_close) {
 		cf_socket_shutdown(&proto_fd_h->sock);
 	}
 
-	as_release_file_handle(proto_fd_h);
+	as_service_rearm(proto_fd_h);
 }
 
 void

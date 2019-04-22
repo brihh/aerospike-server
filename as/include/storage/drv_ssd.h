@@ -26,21 +26,24 @@
 // Includes.
 //
 
-#include <pthread.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_queue.h"
 
 #include "cf_mutex.h"
+#include "cf_thread.h"
 #include "fault.h"
 #include "hist.h"
 
 #include "base/datamodel.h"
 #include "fabric/partition.h"
+#include "storage/storage.h"
 
 
 //==========================================================
@@ -57,11 +60,6 @@ struct drv_ssd_s;
 //==========================================================
 // Typedefs & constants.
 //
-
-// Linux has removed O_DIRECT, but not its functionality.
-#ifndef O_DIRECT
-#define O_DIRECT 00040000
-#endif
 
 #define SSD_HEADER_OLD_MAGIC	(0x4349747275730707L)
 #define SSD_HEADER_MAGIC		(0x4349747275730322L)
@@ -86,13 +84,12 @@ struct drv_ssd_s;
 // Do NOT change SSD_HEADER_SIZE!
 #define SSD_HEADER_SIZE (8 * 1024 * 1024)
 
-// FIXME - remove when fmt-chg is done and no COMPILER_ASSERT collisions.
-
 
 //------------------------------------------------
 // Device header.
 //
 
+// TODO - were we going to change 'prefix' to 'base'?
 typedef struct ssd_common_prefix_s {
 	uint64_t	magic;
 	uint32_t	version;
@@ -103,12 +100,13 @@ typedef struct ssd_common_prefix_s {
 	uint32_t	write_block_size;
 	uint32_t	eventual_regime;
 	uint32_t	last_evict_void_time;
+	uint32_t	roster_generation;
 } ssd_common_prefix;
 
 // Because we pad explicitly:
 COMPILER_ASSERT(sizeof(ssd_common_prefix) <= HI_IO_MIN_SIZE);
 
-// FIXME - deal with the name and the name of as_storage_info_set/get!
+// TODO - deal with the name and the name of as_storage_info_set/get!
 typedef struct ssd_common_pmeta_s {
 	as_partition_version version;
 	uint8_t		tree_id;
@@ -127,7 +125,7 @@ typedef struct ssd_device_common_s {
 typedef struct ssd_device_unique_s {
 	uint32_t	device_id;
 	uint32_t	unused;
-	uint8_t		encrypted_key[32];
+	uint8_t		encrypted_key[64];
 	uint8_t		canary[16];
 } ssd_device_unique;
 
@@ -164,6 +162,7 @@ typedef struct vacated_wblock_s {
 typedef struct {
 	cf_atomic32			rc;
 	cf_atomic32			n_writers;	// number of concurrent writers
+	bool				dirty;		// written to since last flushed
 	bool				skip_post_write_q;
 	uint32_t			n_vacated;
 	uint32_t			vacated_capacity;
@@ -223,16 +222,17 @@ typedef struct drv_ssd_s {
 
 	uint32_t		running;
 
-	pthread_mutex_t	write_lock;			// lock protects writes to current swb
+	cf_mutex		write_lock;			// lock protects writes to current swb
 	ssd_write_buf	*current_swb;		// swb currently being filled by writes
 
 	int				commit_fd;			// relevant for enterprise edition only
 	int				shadow_commit_fd;	// relevant for enterprise edition only
 
-	pthread_mutex_t	defrag_lock;		// lock protects writes to defrag swb
+	cf_mutex		defrag_lock;		// lock protects writes to defrag swb
 	ssd_write_buf	*defrag_swb;		// swb currently being filled by defrag
 
 	cf_queue		*fd_q;				// queue of open fds
+	cf_queue		*fd_cache_q;		// queue of open fds that use page cache
 	cf_queue		*shadow_fd_q;		// queue of open fds on shadow, if any
 
 	cf_queue		*free_wblock_q;		// IDs of free wblocks
@@ -243,7 +243,7 @@ typedef struct drv_ssd_s {
 	cf_queue		*swb_free_q;		// pointers to swbs free and waiting
 	cf_queue		*post_write_q;		// pointers to swbs that have been written but are cached
 
-	uint8_t			encryption_key[32];		// relevant for enterprise edition only
+	uint8_t			encryption_key[64];		// relevant for enterprise edition only
 
 	cf_atomic64		n_defrag_wblock_reads;	// total number of wblocks added to the defrag_wblock_q
 	cf_atomic64		n_defrag_wblock_writes;	// total number of swbs added to the swb_write_q by defrag
@@ -275,20 +275,19 @@ typedef struct drv_ssd_s {
 	uint32_t		sweep_wblock_id;				// wblocks read at startup
 	uint64_t		record_add_older_counter;		// records not inserted due to better existing one
 	uint64_t		record_add_expired_counter;		// records not inserted due to expiration
-	uint64_t		record_add_max_ttl_counter;		// records not inserted due to max-ttl
+	uint64_t		record_add_evicted_counter;		// records not inserted due to eviction
 	uint64_t		record_add_replace_counter;		// records reinserted
 	uint64_t		record_add_unique_counter;		// records inserted
 
 	ssd_alloc_table	*alloc_table;
 
-	pthread_t		write_worker_thread;
-	pthread_t		shadow_worker_thread;
+	cf_tid			write_tid;
+	cf_tid			shadow_tid;
 
 	histogram		*hist_read;
 	histogram		*hist_large_block_read;
 	histogram		*hist_write;
 	histogram		*hist_shadow_write;
-	histogram		*hist_fsync;
 } drv_ssd;
 
 
@@ -321,14 +320,6 @@ typedef struct drv_ssds_s {
 // Private API - for enterprise separation only.
 //
 
-// Artificial limit on write-block-size, in case we ever move to an
-// SSD_HEADER_SIZE that's too big to be a write-block size limit.
-// MAX_WRITE_BLOCK_SIZE must be power of 2 and <= SSD_HEADER_SIZE.
-#define MAX_WRITE_BLOCK_SIZE	(8 * 1024 * 1024)
-
-// Artificial limit on write-block-size, must be power of 2 and >= RBLOCK_SIZE.
-#define MIN_WRITE_BLOCK_SIZE	(1024 * 1)
-
 #define SSD_BLOCK_MAGIC 0x037AF201 // changed for storage version 3
 
 typedef struct ssd_load_records_info_s {
@@ -348,7 +339,8 @@ typedef struct ssd_record_s {
 	uint32_t has_set: 1;
 	uint32_t has_key: 1;
 	uint32_t has_bins: 1; // i.e. is live
-	uint32_t unused: 3;
+	uint32_t is_compressed: 1;
+	uint32_t unused: 2;
 	uint32_t tree_id: 6;
 
 	// offset: 8
@@ -362,6 +354,13 @@ typedef struct ssd_record_s {
 	uint8_t data[];
 } __attribute__ ((__packed__)) ssd_record;
 
+// Compression metadata - relevant for enterprise only.
+typedef struct ssd_comp_meta_s {
+	as_compression_method method;
+	uint32_t orig_sz;
+	uint32_t comp_sz;
+} ssd_comp_meta;
+
 // Per-record optional metadata container.
 typedef struct ssd_rec_props_s {
 	uint32_t void_time;
@@ -370,6 +369,7 @@ typedef struct ssd_rec_props_s {
 	uint32_t key_size;
 	const uint8_t *key;
 	uint32_t n_bins;
+	ssd_comp_meta cm;
 } ssd_rec_props;
 
 // Warm and cool restart.
@@ -377,7 +377,7 @@ void ssd_resume_devices(drv_ssds *ssds);
 void *run_ssd_cool_start(void *udata);
 void ssd_load_wblock_queues(drv_ssds *ssds);
 void ssd_start_maintenance_threads(drv_ssds *ssds);
-void ssd_start_write_worker_threads(drv_ssds *ssds);
+void ssd_start_write_threads(drv_ssds *ssds);
 void ssd_start_defrag_threads(drv_ssds *ssds);
 const uint8_t* ssd_read_record_meta(const ssd_record* block, const uint8_t* end, ssd_rec_props* props, bool single_bin);
 bool ssd_check_bins(const uint8_t* p_read, const uint8_t* end, uint32_t n_bins, bool single_bin); // TODO - demote when cool start unwinds on failure
@@ -389,10 +389,9 @@ void ssd_cold_start_transition_record(struct as_namespace_s *ns, const ssd_recor
 void ssd_cold_start_drop_cenotaphs(struct as_namespace_s *ns);
 
 // Record encryption.
-void ssd_init_encryption_key(struct as_namespace_s *ns);
-void ssd_do_encrypt(const uint8_t *key, uint64_t off, ssd_record *block);
-void ssd_do_decrypt(const uint8_t *key, uint64_t off, ssd_record *block);
-void ssd_do_decrypt_whole(const uint8_t* key, uint64_t off, uint32_t n_rblocks, ssd_record* block);
+void ssd_encrypt(drv_ssd *ssd, uint64_t off, ssd_record *block);
+void ssd_decrypt(drv_ssd *ssd, uint64_t off, ssd_record *block);
+void ssd_decrypt_whole(drv_ssd *ssd, uint64_t off, uint32_t n_rblocks, ssd_record *block);
 
 // CP.
 void ssd_adjust_versions(struct as_namespace_s *ns, ssd_common_pmeta* pmeta);
@@ -400,6 +399,9 @@ conflict_resolution_pol ssd_cold_start_policy(struct as_namespace_s *ns);
 void ssd_cold_start_init_repl_state(struct as_namespace_s *ns, struct as_index_s* r);
 
 // Miscellaneous.
+int ssd_fd_get(drv_ssd *ssd);
+int ssd_shadow_fd_get(drv_ssd *ssd);
+void ssd_fd_put(drv_ssd *ssd, int fd);
 void ssd_header_init_cfg(const struct as_namespace_s *ns, drv_ssd* ssd, ssd_device_header *header);
 void ssd_header_validate_cfg(const struct as_namespace_s *ns, drv_ssd* ssd, const ssd_device_header *header);
 void ssd_flush_final_cfg(struct as_namespace_s *ns);
@@ -415,6 +417,8 @@ int ssd_write_bins(struct as_storage_rd_s *rd);
 int ssd_buffer_bins(struct as_storage_rd_s *rd);
 uint32_t ssd_record_size(struct as_storage_rd_s *rd);
 void ssd_flatten_record(const struct as_storage_rd_s *rd, uint32_t n_rblocks, ssd_record *block);
+uint8_t *ssd_flatten_record_meta(const struct as_storage_rd_s *rd, uint32_t n_rblocks, const ssd_comp_meta *cm, ssd_record *block);
+uint16_t ssd_flatten_bins(const struct as_storage_rd_s *rd, uint8_t *buf, uint32_t *sz);
 ssd_write_buf *swb_get(drv_ssd *ssd);
 
 // Called in (enterprise-split) storage table function.
@@ -518,30 +522,63 @@ BYTES_UP_TO_SHADOW_IO_MIN(drv_ssd *ssd, uint64_t bytes) {
 
 
 //
-// Record encryption.
+// Record compression.
 //
 
-static inline void
-ssd_encrypt(drv_ssd *ssd, uint64_t off, ssd_record *block)
+uint8_t *ssd_flatten_compress(const struct as_storage_rd_s *rd, uint32_t *write_size);
+uint8_t *ssd_flatten_compression_meta(const ssd_comp_meta *cm, ssd_record *block, uint8_t *buf);
+
+bool ssd_decompress_startup(const ssd_comp_meta *cm, uint32_t max_orig_sz, const uint8_t **read, const uint8_t **end);
+bool ssd_decompress_read(const ssd_comp_meta *cm, struct as_storage_rd_s *rd);
+const uint8_t *ssd_read_compression_meta(const ssd_record* block, const uint8_t *read, const uint8_t* end, ssd_comp_meta* cm);
+
+
+//
+// Device IO.
+//
+
+static inline bool
+pread_all(int fd, void* buf, size_t size, off_t offset)
 {
-	if (ssd->ns->storage_encryption_key_file != NULL) {
-		ssd_do_encrypt(ssd->encryption_key, off, block);
+	ssize_t result;
+
+	while ((result = pread(fd, buf, size, offset)) != (ssize_t)size) {
+		if (result < 0) {
+			return false; // let the caller log errors
+		}
+
+		if (result == 0) { // should only happen if caller passed 0 size
+			errno = EINVAL;
+			return false;
+		}
+
+		buf += result;
+		offset += result;
+		size -= result;
 	}
+
+	return true;
 }
 
-static inline void
-ssd_decrypt(drv_ssd *ssd, uint64_t off, ssd_record *block)
+static inline bool
+pwrite_all(int fd, void* buf, size_t size, off_t offset)
 {
-	if (ssd->ns->storage_encryption_key_file != NULL) {
-		ssd_do_decrypt(ssd->encryption_key, off, block);
-	}
-}
+	ssize_t result;
 
-static inline void
-ssd_decrypt_whole(drv_ssd *ssd, uint64_t off, uint32_t n_rblocks,
-		ssd_record *block)
-{
-	if (ssd->ns->storage_encryption_key_file != NULL) {
-		ssd_do_decrypt_whole(ssd->encryption_key, off, n_rblocks, block);
+	while ((result = pwrite(fd, buf, size, offset)) != (ssize_t)size) {
+		if (result < 0) {
+			return false; // let the caller log errors
+		}
+
+		if (result == 0) { // should only happen if caller passed 0 size
+			errno = EINVAL;
+			return false;
+		}
+
+		buf += result;
+		offset += result;
+		size -= result;
 	}
+
+	return true;
 }

@@ -40,6 +40,7 @@
 #include "citrusleaf/cf_queue.h"
 #include "citrusleaf/cf_vector.h"
 
+#include "cf_thread.h"
 #include "dynbuf.h"
 #include "fault.h"
 #include "socket.h"
@@ -270,7 +271,7 @@ as_msg_make_response_msg(uint32_t result_code, uint32_t generation,
 			op->name_sz = as_bin_memcpy_name(ns, op->name, bins[i]);
 		}
 
-		op->op_sz = 4 + op->name_sz;
+		op->op_sz = OP_FIXED_SZ + op->name_sz;
 
 		buf += sizeof(as_msg_op) + op->name_sz;
 		buf += as_bin_particle_to_client(bins[i], op);
@@ -281,13 +282,10 @@ as_msg_make_response_msg(uint32_t result_code, uint32_t generation,
 	return msgp;
 }
 
-// FIXME - only old batch sets include_key false - remove parameter ???
-// FIXME - only old batch sets skip_empty_records false - remove parameter ???
 // Pass NULL bb_r for sizing only. Return value is size if >= 0, error if < 0.
 int32_t
 as_msg_make_response_bufbuilder(cf_buf_builder **bb_r, as_storage_rd *rd,
-		bool no_bin_data, bool include_key, bool skip_empty_records,
-		cf_vector *select_bins)
+		bool no_bin_data, cf_vector *select_bins)
 {
 	as_namespace *ns = rd->ns;
 	as_record *r = rd->r;
@@ -299,7 +297,7 @@ as_msg_make_response_bufbuilder(cf_buf_builder **bb_r, as_storage_rd *rd,
 	const uint8_t* key = NULL;
 	uint32_t key_size = 0;
 
-	if (include_key && r->key_stored == 1) {
+	if (r->key_stored == 1) {
 		if (! as_storage_record_get_key(rd)) {
 			cf_warning(AS_PROTO, "can't get key - skipping record");
 			return -1;
@@ -351,7 +349,7 @@ as_msg_make_response_bufbuilder(cf_buf_builder **bb_r, as_storage_rd *rd,
 			}
 
 			// Don't return an empty record.
-			if (skip_empty_records && n_bins_matched == 0) {
+			if (n_bins_matched == 0) {
 				return 0;
 			}
 		}
@@ -386,7 +384,7 @@ as_msg_make_response_bufbuilder(cf_buf_builder **bb_r, as_storage_rd *rd,
 	m->info2 = 0;
 	m->info3 = 0;
 	m->unused = 0;
-	m->result_code = AS_PROTO_RESULT_OK;
+	m->result_code = AS_OK;
 	m->generation = plain_generation(r->generation, ns);
 	m->record_ttl = r->void_time;
 	m->transaction_ttl = 0;
@@ -457,7 +455,7 @@ as_msg_make_response_bufbuilder(cf_buf_builder **bb_r, as_storage_rd *rd,
 			op->op = AS_MSG_OP_READ;
 			op->version = 0;
 			op->name_sz = as_bin_memcpy_name(ns, op->name, b);
-			op->op_sz = 4 + op->name_sz;
+			op->op_sz = OP_FIXED_SZ + op->name_sz;
 
 			buf += sizeof(as_msg_op) + op->name_sz;
 			buf += as_bin_particle_to_client(b, op);
@@ -472,7 +470,7 @@ as_msg_make_response_bufbuilder(cf_buf_builder **bb_r, as_storage_rd *rd,
 			op->op = AS_MSG_OP_READ;
 			op->version = 0;
 			op->name_sz = as_bin_memcpy_name(ns, op->name, &rd->bins[i]);
-			op->op_sz = 4 + op->name_sz;
+			op->op_sz = OP_FIXED_SZ + op->name_sz;
 
 			buf += sizeof(as_msg_op) + op->name_sz;
 			buf += as_bin_particle_to_client(&rd->bins[i], op);
@@ -554,7 +552,7 @@ as_msg_make_val_response(bool success, const as_val *val, uint32_t result_code,
 	op->op = AS_MSG_OP_READ;
 	op->name_sz = (uint8_t)bin_name_len;
 	memcpy(op->name, bin_name, op->name_sz);
-	op->op_sz = 4 + op->name_sz;
+	op->op_sz = OP_FIXED_SZ + op->name_sz;
 	op->version = 0;
 
 	as_particle_asval_to_client(val, op);
@@ -597,7 +595,7 @@ as_msg_make_val_response_bufbuilder(const as_val *val, cf_buf_builder **bb_r,
 	m->info2 = 0;
 	m->info3 = 0;
 	m->unused = 0;
-	m->result_code = AS_PROTO_RESULT_OK;
+	m->result_code = AS_OK;
 	m->generation = 0;
 	m->record_ttl = 0;
 	m->transaction_ttl = 0;
@@ -611,7 +609,7 @@ as_msg_make_val_response_bufbuilder(const as_val *val, cf_buf_builder **bb_r,
 	op->op = AS_MSG_OP_READ;
 	op->name_sz = (uint8_t)bin_name_len;
 	memcpy(op->name, bin_name, op->name_sz);
-	op->op_sz = 4 + op->name_sz;
+	op->op_sz = OP_FIXED_SZ + op->name_sz;
 	op->version = 0;
 
 	as_particle_asval_to_client(val, op);
@@ -708,21 +706,8 @@ as_netio_init()
 	cf_queue_init(&g_netio_queue, sizeof(as_netio), 64, true);
 	cf_queue_init(&g_netio_slow_queue, sizeof(as_netio), 64, true);
 
-	pthread_t thread;
-	pthread_attr_t attrs;
-
-	pthread_attr_init(&attrs);
-	pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
-
-	if (pthread_create(&thread, &attrs, run_netio,
-			(void *)&g_netio_queue) != 0) {
-		cf_crash(AS_PROTO, "failed to create netio thread");
-	}
-
-	if (pthread_create(&thread, &attrs, run_netio,
-			(void *)&g_netio_slow_queue) != 0) {
-		cf_crash(AS_PROTO, "failed to create netio slow thread");
-	}
+	cf_thread_create_detached(run_netio, (void *)&g_netio_queue);
+	cf_thread_create_detached(run_netio, (void *)&g_netio_slow_queue);
 }
 
 // Based on io object, send buffer to the network, or queue for retry.

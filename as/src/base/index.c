@@ -26,7 +26,6 @@
 
 #include "base/index.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -57,6 +56,7 @@ _mm_prefetch(void *pointer, int unused __attribute__((unused)))
 
 #include "arenax.h"
 #include "cf_mutex.h"
+#include "cf_thread.h"
 #include "fault.h"
 
 #include "base/cfg.h"
@@ -145,16 +145,7 @@ void
 as_index_tree_gc_init()
 {
 	cf_queue_init(&g_gc_queue, sizeof(as_index_tree*), 4096, true);
-
-	pthread_t thread;
-	pthread_attr_t attrs;
-
-	pthread_attr_init(&attrs);
-	pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
-
-	if (pthread_create(&thread, &attrs, run_index_tree_gc, NULL) != 0) {
-		cf_crash(AS_INDEX, "failed to create garbage collection thread");
-	}
+	cf_thread_create_detached(run_index_tree_gc, NULL);
 }
 
 
@@ -759,7 +750,7 @@ as_index_sprig_get_insert_vlock(as_index_sprig *isprig, uint8_t tree_id,
 	cf_arenax_handle n_h = cf_arenax_alloc(isprig->arena, isprig->puddle);
 
 	if (n_h == 0) {
-		cf_warning(AS_INDEX, "arenax alloc failed");
+		cf_ticker_warning(AS_INDEX, "arenax alloc failed");
 		cf_mutex_unlock(&isprig->pair->reduce_lock);
 		cf_mutex_unlock(&isprig->pair->lock);
 		return -1;

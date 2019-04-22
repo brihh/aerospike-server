@@ -24,7 +24,6 @@
 
 #include <dirent.h>
 #include <errno.h>
-#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,14 +44,11 @@
 #include "fault.h"
 
 #include "base/cfg.h"
+#include "base/smd.h"
 #include "base/thr_info.h"
-#include "base/system_metadata.h"
 #include <sys/stat.h>
 
-char udf_smd_module_name[] = "UDF";
 char *as_udf_type_name[] = {"LUA", 0};
-
-static bool g_udf_smd_loaded = false;
 
 static int file_read(char *, uint8_t **, size_t *, unsigned char *);
 static int file_write(char *, uint8_t *, size_t, unsigned char *);
@@ -197,15 +193,13 @@ static int udf_type_getid(char *type) {
  */
 typedef struct udf_get_data_s {
 	cf_dyn_buf *db;        // DynBuf for output.
-	pthread_cond_t *cv;    // Condition variable for signaling callback completion.
-	pthread_mutex_t *mt;   // Mutex protecting the condition variable.
 	bool done;             // Has the callback finished?
 } udf_get_data_t;
 
 /*
  * UDF SMD get metadata items callback.
  */
-static int udf_cask_get_metadata_cb(char *module, as_smd_item_list_t *items, void *udata)
+static void udf_cask_get_metadata_cb(const cf_vector *items, void *udata)
 {
 	udf_get_data_t *p_get_data = (udf_get_data_t *) udata;
 	cf_dyn_buf *out = p_get_data->db;
@@ -216,10 +210,15 @@ static int udf_cask_get_metadata_cb(char *module, as_smd_item_list_t *items, voi
 	// Currently just return directly for LUA
 	uint8_t udf_type = AS_UDF_TYPE_LUA;
 
-	for (int index = 0; index < items->num_items; index++) {
-		as_smd_item_t *item = items->item[index];
-		cf_debug(AS_UDF, "UDF metadata item[%d]:  module \"%s\" ; key \"%s\" ; value \"%s\" ; generation %u ; timestamp %lu",
-				 index, item->module_name, item->key, item->value, item->generation, item->timestamp);
+	for (uint32_t index = 0; index < cf_vector_size(items); index++) {
+		as_smd_item *item = cf_vector_get_ptr(items, index);
+
+		if (item->value == NULL) {
+			continue;
+		}
+
+		cf_debug(AS_UDF, "UDF metadata item[%d]:  key \"%s\" ; value \"%s\" ; generation %u ; timestamp %lu",
+				 index, item->key, item->value, item->generation, item->timestamp);
 		cf_dyn_buf_append_string(out, "filename=");
 		cf_dyn_buf_append_buf(out, (uint8_t *)item->key, strlen(item->key));
 		cf_dyn_buf_append_string(out, ",");
@@ -234,17 +233,7 @@ static int udf_cask_get_metadata_cb(char *module, as_smd_item_list_t *items, voi
 		cf_dyn_buf_append_string(out, ";");
 	}
 
-	pthread_mutex_lock(p_get_data->mt);
-
 	p_get_data->done = true;
-	int retval = pthread_cond_signal(p_get_data->cv);
-	if (retval) {
-		cf_warning(AS_UDF, "pthread_cond_signal failed (rv %d)", retval);
-	}
-
-	pthread_mutex_unlock(p_get_data->mt);
-
-	return retval;
 }
 
 /*
@@ -254,35 +243,11 @@ int udf_cask_info_list(char *name, cf_dyn_buf *out)
 {
 	cf_debug(AS_UDF, "UDF CASK INFO LIST");
 
-	pthread_mutex_t get_data_mutex = PTHREAD_MUTEX_INITIALIZER;
-	pthread_cond_t get_data_cond_var = PTHREAD_COND_INITIALIZER;
+	udf_get_data_t get_data = { .db = out, .done = false };
 
-	udf_get_data_t get_data;
-	get_data.db = out;
-	get_data.cv = &get_data_cond_var;
-	get_data.mt = &get_data_mutex;
-	get_data.done = false;
+	as_smd_get_all(AS_SMD_MODULE_UDF, udf_cask_get_metadata_cb, &get_data);
 
-	pthread_mutex_lock(&get_data_mutex);
-
-	int retval = as_smd_get_metadata(udf_smd_module_name, "", udf_cask_get_metadata_cb, &get_data);
-	if (!retval) {
-		do { // [Note:  Loop protects against spurious wakeups.]
-			if ((retval = pthread_cond_wait(&get_data_cond_var, &get_data_mutex))) {
-				cf_warning(AS_UDF, "pthread_cond_wait failed (rv %d)", retval);
-				break;
-			}
-		} while (!get_data.done);
-	} else {
-		cf_warning(AS_UDF, "failed to get UDF metadata (rv %d)", retval);
-	}
-
-	pthread_mutex_unlock(&get_data_mutex);
-
-	pthread_mutex_destroy(&get_data_mutex);
-	pthread_cond_destroy(&get_data_cond_var);
-
-	return retval;
+	return 0;
 }
 
 /*
@@ -501,14 +466,13 @@ int udf_cask_info_put(char *name, char * params, cf_dyn_buf * out) {
 	cf_debug(AS_UDF, "created json object %s", udf_obj_str);
 
 	// how do I know whether to call create or add?
-	e = as_smd_set_metadata(udf_smd_module_name, filename, udf_obj_str);
-	if (e) {
-		cf_warning(AS_UDF, "could not add UDF metadata, error %d", e);
-		cf_free(udf_obj_str);
-		return(-1);
+	if (as_smd_set_blocking(AS_SMD_MODULE_UDF, filename, udf_obj_str, 0)) {
+		cf_info(AS_UDF, "UDF module '%s' (%s/%s) registered", filename, g_config.mod_lua.user_path, filename);
 	}
-
-	cf_info(AS_UDF, "UDF module '%s' (%s/%s) registered", filename, g_config.mod_lua.user_path, filename);
+	else {
+		cf_warning(AS_UDF, "UDF module '%s' (%s/%s) timeout", filename, g_config.mod_lua.user_path, filename);
+		cf_dyn_buf_append_string(out, "error=timeout");
+	}
 
 	// free the metadata
 	cf_free(udf_obj_str);
@@ -521,8 +485,7 @@ int udf_cask_info_remove(char *name, char * params, cf_dyn_buf * out) {
 
 	char    filename[128]   = {0};
 	int     filename_len    = sizeof(filename);
-	char file_path[1024]	= {0};
-	struct stat buf;
+	char file_path[1024]    = {0};
 
 	cf_debug(AS_INFO, "UDF CASK INFO REMOVE");
 
@@ -538,21 +501,14 @@ int udf_cask_info_remove(char *name, char * params, cf_dyn_buf * out) {
 
 	cf_debug(AS_INFO, " Lua file removal full-path is : %s \n", file_path);
 
-	if (stat(file_path, &buf) != 0) {
-		cf_info(AS_UDF, "failed to read file from : %s, error : %s", file_path, cf_strerror(errno));
-		cf_dyn_buf_append_string(out, "error=file_not_found");
+	if (! as_smd_delete_blocking(AS_SMD_MODULE_UDF, filename, 0)) {
+		cf_warning(AS_UDF, "UDF module '%s' (%s) remove timeout", filename, file_path);
+		cf_dyn_buf_append_string(out, "error=timeout");
 		return -1;
 	}
 
-	as_smd_delete_metadata(udf_smd_module_name, filename);
-
-	// this is what an error would look like
-	//    cf_dyn_buf_append_string(out, "error=");
-	//    cf_dyn_buf_append_int(out, resp);
-
-	cf_dyn_buf_append_string(out, "ok");
-
 	cf_info(AS_UDF, "UDF module '%s' (%s) removed", filename, file_path);
+	cf_dyn_buf_append_string(out, "ok");
 
 	return 0;
 }
@@ -586,48 +542,24 @@ int udf_cask_info_configure(char *name, char * params, cf_dyn_buf * buf) {
 	return 0;
 }
 
-//
-// take a current list and return the new list
-// Validates that items are correct? or is that done with the add?
-// How do you signal that there are no changes between the current list and the new list?
-
-int
-udf_cask_smd_merge_fn (char *module, as_smd_item_list_t **item_list_out, as_smd_item_list_t **item_lists_in, size_t num_lists, void *udata)
-{
-	cf_debug(AS_UDF, "UDF CASK merge function");
-
-	// (For now, just send back an empty metadata item list.)
-	as_smd_item_list_t *item_list = as_smd_item_list_create(0);
-	*item_list_out = item_list;
-
-	return(0);
-}
-
 // This function must take the current "view of the world" and
 // make the local store the same as that.
 
-int
-udf_cask_smd_accept_fn(char *module, as_smd_item_list_t *items, void *udata, uint32_t accept_opt)
+void
+udf_cask_smd_accept_fn(const cf_vector *items, as_smd_accept_type accept_type)
 {
-	if (accept_opt & AS_SMD_ACCEPT_OPT_CREATE) {
-		cf_debug(AS_UDF, "(doing nothing in UDF accept cb for module creation)");
-		g_udf_smd_loaded = true;
-		return 0;
-	}
-
-	cf_debug(AS_UDF, "UDF CASK accept fn : n items %zu", items->num_items);
+	cf_debug(AS_UDF, "UDF CASK accept fn : n items %u", cf_vector_size(items));
 
 	// For each item in the list, see if the current version
 	// is different from the curretly stored version
 	// and if the new item is new, write to the storage directory
-	for (int i = 0; i < items->num_items ; i++) {
+	for (uint32_t i = 0; i < cf_vector_size(items); i++) {
+		as_smd_item *item = cf_vector_get_ptr(items, i);
 
-		as_smd_item_t *item = items->item[i];
-
-		if (item->action == AS_SMD_ACTION_SET) {
-
+		if (item->value != NULL) {
 			json_error_t json_error;
 			json_t *item_obj = json_loads(item->value, 0 /*flags*/, &json_error);
+
 			if (!item_obj) {
 				cf_warning(AS_UDF, "failed to parse UDF \"%s\" with JSON error: %s ; source: %s ; line: %d ; column: %d ; position: %d",
 						   item->key, json_error.text, json_error.source, json_error.line, json_error.column, json_error.position);
@@ -673,8 +605,8 @@ udf_cask_smd_accept_fn(char *module, as_smd_item_list_t *items, void *udata, uin
 			as_module_update(&mod_lua, &ame);
 			mod_lua_unlock(&mod_lua);
 		}
-		else if (item->action == AS_SMD_ACTION_DELETE) {
-			cf_debug(AS_UDF, "received DELETE SMD action %d key %s", item->action, item->key);
+		else {
+			cf_debug(AS_UDF, "received DELETE SMD key %s", item->key);
 
 			mod_lua_wrlock(&mod_lua);
 			file_remove(item->key);
@@ -687,14 +619,8 @@ udf_cask_smd_accept_fn(char *module, as_smd_item_list_t *items, void *udata, uin
 			as_module_update(&mod_lua, &e);
 
 			mod_lua_unlock(&mod_lua);
-
-		}
-		else {
-			cf_info(AS_UDF, "received unknown SMD action %d", item->action);
 		}
 	}
-
-	return(0);
 }
 
 
@@ -727,15 +653,5 @@ udf_cask_init()
 	}
 	closedir(dir);
 
-	// as_smd_create_module(udf_smd_module_name, udf_cask_smd_merge_fn, 0, udf_cask_smd_accept_fn, 0);
-	// take the default merge function
-	if (as_smd_create_module(udf_smd_module_name, 0, 0, 0, 0, udf_cask_smd_accept_fn, 0, 0, 0)) {
-		cf_crash(AS_UDF, "failed to create SMD module \"%s\"", udf_smd_module_name);
-	}
-
-	while (! g_udf_smd_loaded) {
-		usleep(1000);
-	}
-
-	// there may be existing data. Read it and populate the local file system.
+	as_smd_module_load(AS_SMD_MODULE_UDF, udf_cask_smd_accept_fn, NULL, NULL);
 }

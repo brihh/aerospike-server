@@ -84,6 +84,7 @@
 #include <unistd.h>
 
 #include "citrusleaf/cf_atomic.h"
+#include "citrusleaf/cf_byte_order.h"
 #include "citrusleaf/cf_clock.h"
 #include "citrusleaf/cf_queue.h"
 
@@ -108,8 +109,8 @@
 #include "base/datamodel.h"
 #include "base/index.h"
 #include "base/proto.h"
+#include "base/smd.h"
 #include "base/stats.h"
-#include "base/system_metadata.h"
 #include "base/thr_sindex.h"
 #include "base/thr_info.h"
 #include "fabric/partition.h"
@@ -209,14 +210,14 @@ inline bool as_sindex_isactive(as_sindex *si)
 // Translation from sindex internal error code to generic client visible Aerospike error code
 uint8_t as_sindex_err_to_clienterr(int err, char *fname, int lineno) {
 	switch (err) {
-		case AS_SINDEX_ERR_FOUND:        return AS_PROTO_RESULT_FAIL_INDEX_FOUND;
-		case AS_SINDEX_ERR_INAME_MAXLEN: return AS_PROTO_RESULT_FAIL_INDEX_NAME_MAXLEN;
-		case AS_SINDEX_ERR_MAXCOUNT:     return AS_PROTO_RESULT_FAIL_INDEX_MAXCOUNT;
-		case AS_SINDEX_ERR_NOTFOUND:     return AS_PROTO_RESULT_FAIL_INDEX_NOTFOUND;
-		case AS_SINDEX_ERR_NOT_READABLE: return AS_PROTO_RESULT_FAIL_INDEX_NOTREADABLE;
-		case AS_SINDEX_ERR_NO_MEMORY:    return AS_PROTO_RESULT_FAIL_INDEX_OOM;
-		case AS_SINDEX_ERR_PARAM:        return AS_PROTO_RESULT_FAIL_PARAMETER;
-		case AS_SINDEX_OK:               return AS_PROTO_RESULT_OK;
+		case AS_SINDEX_ERR_FOUND:        return AS_ERR_SINDEX_FOUND;
+		case AS_SINDEX_ERR_INAME_MAXLEN: return AS_ERR_SINDEX_NAME;
+		case AS_SINDEX_ERR_MAXCOUNT:     return AS_ERR_SINDEX_MAX_COUNT;
+		case AS_SINDEX_ERR_NOTFOUND:     return AS_ERR_SINDEX_NOT_FOUND;
+		case AS_SINDEX_ERR_NOT_READABLE: return AS_ERR_SINDEX_NOT_READABLE;
+		case AS_SINDEX_ERR_NO_MEMORY:    return AS_ERR_SINDEX_OOM;
+		case AS_SINDEX_ERR_PARAM:        return AS_ERR_PARAMETER;
+		case AS_SINDEX_OK:               return AS_OK;
 
 		// Defensive internal error
 		case AS_SINDEX_ERR:
@@ -225,8 +226,8 @@ uint8_t as_sindex_err_to_clienterr(int err, char *fname, int lineno) {
 		case AS_SINDEX_ERR_TYPE_MISMATCH:
 		case AS_SINDEX_ERR_UNKNOWN_KEYTYPE:
 		default: cf_warning(AS_SINDEX, "%s %d Error at %s,%d",
-							 as_sindex_err_str(err), err, fname, lineno);
-											return AS_PROTO_RESULT_FAIL_INDEX_GENERIC;
+				as_sindex_err_str(err), err, fname, lineno);
+		return AS_ERR_SINDEX_GENERIC;
 	}
 }
 
@@ -480,7 +481,14 @@ as_sindex__populate_binid(as_namespace *ns, as_sindex_metadata *imd)
 		return AS_SINDEX_ERR;
 	}
 
-	imd->binid = as_bin_get_or_assign_id_w_len(ns, imd->bname, len);
+	uint16_t id;
+
+	if (! as_bin_get_or_assign_id_w_len(ns, imd->bname, len, &id)) {
+		cf_warning(AS_SINDEX, "Bin %s not added. Assign id failed", imd->bname);
+		return AS_SINDEX_ERR;
+	}
+
+	imd->binid = id;
 
 	return AS_SINDEX_OK;
 }
@@ -2470,7 +2478,7 @@ as_sindex_range_from_msg(as_namespace *ns, as_msg *msgp, as_sindex_range *srange
 					"Can only handle 8 byte numerics right now %u", startl);
 				goto Cleanup;
 			}
-			start->u.i64  = __cpu_to_be64(*((uint64_t *)data));
+			start->u.i64  = cf_swap_from_be64(*((uint64_t *)data));
 			data         += sizeof(uint64_t);
 
 			// get end point
@@ -2481,7 +2489,7 @@ as_sindex_range_from_msg(as_namespace *ns, as_msg *msgp, as_sindex_range *srange
 						"can only handle 8 byte numerics right now %u", endl);
 				goto Cleanup;
 			}
-			end->u.i64  = __cpu_to_be64(*((uint64_t *)data));
+			end->u.i64  = cf_swap_from_be64(*((uint64_t *)data));
 			data       += sizeof(uint64_t);
 			if (start->u.i64 > end->u.i64) {
 				cf_warning(AS_SINDEX,
@@ -4074,24 +4082,11 @@ as_sindex_put_rd(as_sindex *si, as_storage_rd *rd)
  *
  */
 
-// Global flag to signal that all secondary index SMD is restored.
-static bool g_sindex_smd_restored = false;
-
 void
 as_sindex_init_smd()
 {
-	int retval = as_smd_create_module(SINDEX_MODULE,
-				as_smd_majority_consensus_merge, NULL,
-				NULL, NULL,
-				as_sindex_smd_accept_cb, NULL,
-				NULL, NULL);
-
-	cf_assert(retval == 0, AS_SINDEX, "failed to create sindex SMD module (rv %d)", retval);
-
-	// Wait for Secondary Index SMD to be completely restored.
-	while (! g_sindex_smd_restored) {
-		usleep(1000);
-	}
+	as_smd_module_load(AS_SMD_MODULE_SINDEX, as_sindex_smd_accept_cb, NULL,
+			NULL);
 }
 
 /*
@@ -4329,16 +4324,11 @@ as_sindex_delete_imd_to_smd_key(as_namespace *ns, as_sindex_metadata *imd, char 
 	return true;
 }
 
-int
-as_sindex_smd_accept_cb(char *module, as_smd_item_list_t *items, void *udata, uint32_t accept_opt)
+void
+as_sindex_smd_accept_cb(const cf_vector *items, as_smd_accept_type accept_type)
 {
-	if ((accept_opt & AS_SMD_ACCEPT_OPT_CREATE) != 0) {
-		g_sindex_smd_restored = true;
-		return 0;
-	}
-
-	for (int i = 0; i < (int)items->num_items; i++) {
-		as_smd_item_t *item = items->item[i];
+	for (uint32_t i = 0; i < cf_vector_size(items); i++) {
+		const as_smd_item *item = cf_vector_get_ptr(items, i);
 		as_sindex_metadata imd;
 
 		memset(&imd, 0, sizeof(imd)); // TODO - arrange to use { 0 } ???
@@ -4356,21 +4346,16 @@ as_sindex_smd_accept_cb(char *module, as_smd_item_list_t *items, void *udata, ui
 			continue;
 		}
 
-		if (item->action == AS_SMD_ACTION_SET) {
+		if (item->value != NULL) {
 			smd_value_to_imd(item->value, &imd); // sets index name
 			as_sindex_smd_create(ns, &imd);
 		}
-		else if (item->action == AS_SMD_ACTION_DELETE) {
-			as_sindex_destroy(ns, &imd);
-		}
 		else {
-			cf_warning(AS_SINDEX, "smd accept cb - unknown action");
+			as_sindex_destroy(ns, &imd);
 		}
 
 		as_sindex_imd_free(&imd);
 	}
-
-	return 0;
 }
 //                                     END - SMD CALLBACKS
 // ************************************************************************************************

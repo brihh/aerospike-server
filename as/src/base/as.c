@@ -36,7 +36,9 @@
 
 #include "citrusleaf/alloc.h"
 
+#include "cf_thread.h"
 #include "daemon.h"
+#include "dns.h"
 #include "fault.h"
 #include "hardware.h"
 #include "tls.h"
@@ -44,15 +46,17 @@
 #include "base/batch.h"
 #include "base/cfg.h"
 #include "base/datamodel.h"
+#include "base/health.h"
 #include "base/index.h"
 #include "base/json_init.h"
 #include "base/monitor.h"
+#include "base/nsup.h"
 #include "base/scan.h"
 #include "base/secondary_index.h"
 #include "base/security.h"
-#include "base/system_metadata.h"
+#include "base/service.h"
+#include "base/smd.h"
 #include "base/stats.h"
-#include "base/thr_batch.h"
 #include "base/thr_info.h"
 #include "base/thr_info_port.h"
 #include "base/thr_sindex.h"
@@ -160,7 +164,9 @@ static const char SMD_DIR_NAME[] = "/smd";
 // Globals.
 //
 
+// Not cf_mutex, which won't tolerate unlock if already unlocked.
 pthread_mutex_t g_main_deadlock = PTHREAD_MUTEX_INITIALIZER;
+
 bool g_startup_complete = false;
 bool g_shutdown_started = false;
 
@@ -169,10 +175,8 @@ bool g_shutdown_started = false;
 // Forward declarations.
 //
 
-// signal.c, thr_demarshal.c and thr_nsup.c don't have header files.
+// signal.c doesn't have header file.
 extern void as_signal_setup();
-extern void as_demarshal_start();
-extern void as_nsup_start();
 
 static void write_pidfile(char *pidfile);
 static void validate_directory(const char *path, const char *log_tag);
@@ -186,7 +190,10 @@ static void validate_smd_directory();
 int
 main(int argc, char **argv)
 {
-	g_start_ms = cf_getms();
+	g_start_sec = cf_get_seconds();
+
+	// Initialize cf_thread wrapper.
+	cf_thread_init();
 
 	// Initialize memory allocation.
 	cf_alloc_init();
@@ -340,7 +347,6 @@ main(int argc, char **argv)
 
 	// Check that required directories are set up properly.
 	validate_directory(c->work_directory, "work");
-	validate_directory(c->mod_lua.system_path, "Lua system");
 	validate_directory(c->mod_lua.user_path, "Lua user");
 	validate_smd_directory();
 
@@ -349,9 +355,9 @@ main(int argc, char **argv)
 	// nodes or clients yet.)
 
 	as_json_init();				// Jansson JSON API used by System Metadata
-	as_smd_init();				// System Metadata first - others depend on it
 	as_index_tree_gc_init();	// thread to purge dropped index trees
 	as_sindex_thr_init();		// defrag secondary index (ok during population)
+	as_nsup_init();				// load previous evict-void-time(s)
 
 	// Initialize namespaces. Each namespace decides here whether it will do a
 	// warm or cold start. Index arenas, partition structures and index tree
@@ -378,7 +384,8 @@ main(int argc, char **argv)
 
 	cf_info(AS_AS, "initializing services...");
 
-	as_netio_init();
+	cf_dns_init();				// DNS resolver
+	as_netio_init();			// query responses
 	as_security_init();			// security features
 	as_tsvc_init();				// all transaction handling
 	as_hb_init();				// inter-node heartbeat
@@ -394,7 +401,6 @@ main(int argc, char **argv)
 	as_udf_init();				// user-defined functions
 	as_scan_init();				// scan a namespace or set
 	as_batch_init();			// batch transaction handling
-	as_batch_direct_init();		// low priority transaction handling
 	as_xdr_init();				// cross data-center replication
 	as_mon_init();				// monitor
 
@@ -405,14 +411,15 @@ main(int argc, char **argv)
 	// Start subsystems. At this point we may begin communicating with other
 	// cluster nodes, and ultimately with clients.
 
-	as_smd_start(g_smd);		// enables receiving cluster state change events
+	as_smd_start();				// enables receiving cluster state change events
+	as_health_start();			// starts before fabric and hb to capture them
 	as_fabric_start();			// may send & receive fabric messages
 	as_xdr_start();				// XDR should start before it joins other nodes
 	as_hb_start();				// start inter-node heartbeat
 	as_exchange_start();		// start the cluster exchange subsystem
 	as_clustering_start();		// clustering-v5 start
-	as_nsup_start();			// may send delete transactions to other nodes
-	as_demarshal_start();		// server will now receive client transactions
+	as_nsup_start();			// may send evict-void-time(s) to other nodes
+	as_service_start();			// server will now receive client transactions
 	as_info_port_start();		// server will now receive info transactions
 	as_ticker_start();			// only after everything else is started
 
@@ -447,7 +454,6 @@ main(int argc, char **argv)
 
 	as_storage_shutdown(instance);
 	as_xdr_shutdown();
-	as_smd_shutdown(g_smd);
 
 	cf_info(AS_AS, "finished clean shutdown - exiting");
 

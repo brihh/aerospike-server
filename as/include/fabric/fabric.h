@@ -30,6 +30,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "citrusleaf/alloc.h"
+
 #include "msg.h"
 #include "node.h"
 #include "socket.h"
@@ -91,9 +93,23 @@ extern cf_tls_info *g_fabric_tls;
 // msg
 //
 
-msg *as_fabric_msg_get(msg_type type);
-void as_fabric_msg_put(msg *m);
 void as_fabric_msg_queue_dump(void);
+
+static inline msg *
+as_fabric_msg_get(msg_type type)
+{
+	// Never returns NULL. Will assert if type is not registered.
+	return msg_create(type);
+}
+
+static inline void
+as_fabric_msg_put(msg *m)
+{
+	if (cf_rc_release(m) == 0) {
+		msg_reset(m);
+		msg_put(m);
+	}
+}
 
 //------------------------------------------------
 // as_fabric
@@ -111,20 +127,3 @@ bool as_fabric_is_published_endpoint_list(const struct as_endpoint_list_s *list)
 struct as_endpoint_list_s *as_fabric_hb_plugin_get_endpoint_list(struct as_hb_plugin_node_data_s *plugin_data);
 void as_fabric_rate_capture(fabric_rate *rate);
 void as_fabric_dump(bool verbose);
-
-
-//==============================================================================
-// Fabric transact.
-//
-
-// Used to send a request, and receive a response, reliably. This is guaranteed
-// to NEVER return an error directly, but might call the callback function
-// saying that we ran out of time or had some other error.
-//
-// Requires field 0 be a uint64_t which will be used by the fabric system - an
-// unknown error will be thrown if this is not true.
-
-void as_fabric_transact_init(void);
-void as_fabric_transact_start(cf_node node_id, msg *m, int timeout_ms, as_fabric_transact_complete_fn cb, void *userdata);
-int as_fabric_transact_register(msg_type type, const msg_template *mt, size_t mt_sz, size_t scratch_sz, as_fabric_transact_recv_fn cb, void *udata);
-int as_fabric_transact_reply(msg *reply_msg, void *transact_data);

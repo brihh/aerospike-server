@@ -26,7 +26,6 @@
 
 #include "base/thr_tsvc.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -40,6 +39,7 @@
 #include "citrusleaf/cf_digest.h"
 #include "citrusleaf/cf_queue.h"
 
+#include "cf_thread.h"
 #include "fault.h"
 #include "hardware.h"
 #include "node.h"
@@ -51,7 +51,6 @@
 #include "base/secondary_index.h"
 #include "base/security.h"
 #include "base/stats.h"
-#include "base/thr_batch.h"
 #include "base/transaction.h"
 #include "base/transaction_policy.h"
 #include "base/xdr_serverside.h"
@@ -98,12 +97,6 @@ static inline bool
 should_security_check_data_op(const as_transaction *tr)
 {
 	return tr->origin == FROM_CLIENT || tr->origin == FROM_BATCH;
-}
-
-static inline bool
-read_would_duplicate_resolve(const as_namespace* ns, const as_msg* m)
-{
-	return READ_CONSISTENCY_LEVEL(ns, *m) == AS_READ_CONSISTENCY_LEVEL_ALL;
 }
 
 static const char*
@@ -222,7 +215,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 	if (tr->origin == FROM_CLIENT) {
 		uint8_t result = as_security_check(tr->from.proto_fd_h, PERM_NONE);
 
-		if (result != AS_PROTO_RESULT_OK) {
+		if (result != AS_OK) {
 			as_security_log(tr->from.proto_fd_h, result, PERM_NONE, NULL, NULL);
 			as_transaction_error(tr, NULL, (uint32_t)result);
 			goto Cleanup;
@@ -234,7 +227,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 	if (! nf) {
 		cf_warning(AS_TSVC, "no namespace in protocol request");
-		as_transaction_error(tr, NULL, AS_PROTO_RESULT_FAIL_NAMESPACE);
+		as_transaction_error(tr, NULL, AS_ERR_NAMESPACE);
 		goto Cleanup;
 	}
 
@@ -247,16 +240,23 @@ as_tsvc_process_transaction(as_transaction *tr)
 		cf_warning(AS_TSVC, "unknown namespace %s (%u) in protocol request - check configuration file",
 				ns_name, ns_sz);
 
-		as_transaction_error(tr, NULL, AS_PROTO_RESULT_FAIL_NAMESPACE);
+		as_transaction_error(tr, NULL, AS_ERR_NAMESPACE);
 		goto Cleanup;
 	}
 
 	// Have we finished the very first partition balance?
 	if (! as_partition_balance_is_init_resolved()) {
-		cf_debug(AS_TSVC, "rejecting transaction - initial partition balance unresolved");
-		as_transaction_error(tr, NULL, AS_PROTO_RESULT_FAIL_UNAVAILABLE);
-		// Note that we forfeited namespace info above so scan & query don't get
-		// counted as single-record error.
+		if (tr->origin == FROM_PROXY) {
+			as_proxy_return_to_sender(tr, ns);
+			tr->from.proxy_node = 0; // pattern, not needed
+		}
+		else {
+			cf_debug(AS_TSVC, "rejecting transaction - initial partition balance unresolved");
+			as_transaction_error(tr, NULL, AS_ERR_UNAVAILABLE);
+			// Note that we forfeited namespace info above so scan & query don't
+			// get counted as single-record error.
+		}
+
 		goto Cleanup;
 	}
 
@@ -266,7 +266,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 	if (as_transaction_is_multi_record(tr)) {
 		if (m->transaction_ttl != 0) {
-			// Old batch and queries may specify transaction_ttl, but don't use
+			// Queries may specify transaction_ttl, but don't use
 			// g_config.transaction_max_ns as a default. Assuming specified TTL
 			// is large enough that it's not worth checking for timeout here.
 			tr->end_time = tr->start_time +
@@ -274,16 +274,8 @@ as_tsvc_process_transaction(as_transaction *tr)
 		}
 
 		if (as_transaction_is_batch_direct(tr)) {
-			// Old batch.
-			if (! as_security_check_data_op(tr, ns, PERM_READ)) {
-				as_multi_rec_transaction_error(tr, tr->result_code);
-				goto Cleanup;
-			}
-
-			if ((rv = as_batch_direct_queue_task(tr, ns)) != 0) {
-				as_multi_rec_transaction_error(tr, rv);
-				cf_atomic64_incr(&g_stats.batch_errors);
-			}
+			// Old batch - deprecated.
+			as_multi_rec_transaction_error(tr, AS_ERR_UNSUPPORTED_FEATURE);
 		}
 		else if (as_transaction_is_query(tr)) {
 			// Query.
@@ -335,7 +327,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 	// Did the transaction time out while on the queue?
 	if (cf_getns() > tr->end_time) {
 		cf_debug(AS_TSVC, "transaction timed out in queue");
-		as_transaction_error(tr, ns, AS_PROTO_RESULT_FAIL_TIMEOUT);
+		as_transaction_error(tr, ns, AS_ERR_TIMEOUT);
 		goto Cleanup;
 	}
 
@@ -349,7 +341,7 @@ as_tsvc_process_transaction(as_transaction *tr)
 
 		if (digest_sz != sizeof(cf_digest)) {
 			cf_warning(AS_TSVC, "digest msg field size %u", digest_sz);
-			as_transaction_error(tr, ns, AS_PROTO_RESULT_FAIL_PARAMETER);
+			as_transaction_error(tr, ns, AS_ERR_PARAMETER);
 			goto Cleanup;
 		}
 
@@ -396,18 +388,17 @@ as_tsvc_process_transaction(as_transaction *tr)
 			goto Cleanup;
 		}
 
-		rv = as_partition_reserve_read(ns, pid, &tr->rsv,
-				read_would_duplicate_resolve(ns, m), &dest);
+		rv = as_partition_reserve_read_tr(ns, pid, tr, &dest);
 	}
 	else {
 		cf_warning(AS_TSVC, "transaction is neither read nor write - unexpected");
-		as_transaction_error(tr, ns, AS_PROTO_RESULT_FAIL_PARAMETER);
+		as_transaction_error(tr, ns, AS_ERR_PARAMETER);
 		goto Cleanup;
 	}
 
 	if (rv == -2) {
 		// Partition is unavailable.
-		as_transaction_error(tr, ns, AS_PROTO_RESULT_FAIL_UNAVAILABLE);
+		as_transaction_error(tr, ns, AS_ERR_UNAVAILABLE);
 		goto Cleanup;
 	}
 
@@ -478,11 +469,8 @@ as_tsvc_process_transaction(as_transaction *tr)
 			tr->from.proxy_node = 0; // pattern, not needed
 			break;
 		case FROM_IUDF:
-			tr->from.iudf_orig->cb(tr->from.iudf_orig->udata,
-					AS_PROTO_RESULT_FAIL_UNKNOWN);
+			tr->from.iudf_orig->cb(tr->from.iudf_orig->udata, AS_ERR_UNKNOWN);
 			tr->from.iudf_orig = NULL; // pattern, not needed
-			break;
-		case FROM_NSUP:
 			break;
 		case FROM_RE_REPL:
 			tr->from.re_repl_orig_cb(tr);
@@ -509,21 +497,11 @@ Cleanup:
 void
 tsvc_add_threads(uint32_t qid, uint32_t n_threads)
 {
-	pthread_t thread;
-	pthread_attr_t attrs;
-
-	pthread_attr_init(&attrs);
-	pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
-
 	for (uint32_t n = 0; n < n_threads; n++) {
-		if (pthread_create(&thread, &attrs, run_tsvc,
-				(void*)(uint64_t)qid) == 0) {
-			g_queues_n_threads[qid]++;
-		}
-		else {
-			cf_warning(AS_TSVC, "tsvc queue %u failed thread create", qid);
-		}
+		cf_thread_create_detached(run_tsvc, (void*)(uint64_t)qid);
 	}
+
+	g_queues_n_threads[qid] += n_threads;
 }
 
 
@@ -535,8 +513,9 @@ tsvc_remove_threads(uint32_t qid, uint32_t n_threads)
 	for (uint32_t n = 0; n < n_threads; n++) {
 		// Send terminator (transaction with NULL msgp).
 		cf_queue_push(g_transaction_queues[qid], &death_tr);
-		g_queues_n_threads[qid]--;
 	}
+
+	g_queues_n_threads[qid] -= n_threads;
 }
 
 

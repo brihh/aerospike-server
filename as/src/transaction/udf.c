@@ -26,7 +26,6 @@
 
 #include "transaction/udf.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -46,6 +45,7 @@
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_clock.h"
 
+#include "cf_mutex.h"
 #include "dynbuf.h"
 #include "fault.h"
 
@@ -59,7 +59,6 @@
 #include "base/udf_arglist.h"
 #include "base/udf_cask.h"
 #include "base/udf_record.h"
-#include "base/udf_timer.h"
 #include "fabric/partition.h"
 #include "storage/storage.h"
 #include "transaction/duplicate_resolve.h"
@@ -94,6 +93,9 @@ typedef struct udf_call_s {
 
 as_aerospike g_as_aerospike;
 
+// Deadline per UDF.
+static __thread uint64_t g_end_ns;
+
 
 //==========================================================
 // Forward declarations.
@@ -116,11 +118,12 @@ void udf_timeout_cb(rw_request* rw);
 transaction_status udf_master(rw_request* rw, as_transaction* tr);
 udf_optype udf_master_apply(udf_call* call, rw_request* rw);
 int udf_apply_record(udf_call* call, as_rec* rec, as_result* result);
-uint64_t udf_end_time(time_tracker* tt);
 void udf_finish(udf_record* urecord, rw_request* rw, udf_optype* record_op);
 udf_optype udf_finish_op(udf_record* urecord);
 void udf_post_processing(udf_record* urecord, rw_request* rw,
 		udf_optype urecord_op);
+bool udf_timer_timedout(const as_timer* timer);
+uint64_t udf_timer_timeslice(const as_timer* timer);
 
 void update_lua_complete_stats(uint8_t origin, as_namespace* ns, udf_optype op,
 		int ret, bool is_success);
@@ -140,10 +143,10 @@ static inline void
 client_udf_update_stats(as_namespace* ns, uint8_t result_code)
 {
 	switch (result_code) {
-	case AS_PROTO_RESULT_OK:
+	case AS_OK:
 		cf_atomic64_incr(&ns->n_client_udf_complete);
 		break;
-	case AS_PROTO_RESULT_FAIL_TIMEOUT:
+	case AS_ERR_TIMEOUT:
 		cf_atomic64_incr(&ns->n_client_udf_timeout);
 		break;
 	default:
@@ -153,13 +156,29 @@ client_udf_update_stats(as_namespace* ns, uint8_t result_code)
 }
 
 static inline void
+from_proxy_udf_update_stats(as_namespace* ns, uint8_t result_code)
+{
+	switch (result_code) {
+	case AS_OK:
+		cf_atomic64_incr(&ns->n_from_proxy_udf_complete);
+		break;
+	case AS_ERR_TIMEOUT:
+		cf_atomic64_incr(&ns->n_from_proxy_udf_timeout);
+		break;
+	default:
+		cf_atomic64_incr(&ns->n_from_proxy_udf_error);
+		break;
+	}
+}
+
+static inline void
 udf_sub_udf_update_stats(as_namespace* ns, uint8_t result_code)
 {
 	switch (result_code) {
-	case AS_PROTO_RESULT_OK:
+	case AS_OK:
 		cf_atomic64_incr(&ns->n_udf_sub_udf_complete);
 		break;
-	case AS_PROTO_RESULT_FAIL_TIMEOUT:
+	case AS_ERR_TIMEOUT:
 		cf_atomic64_incr(&ns->n_udf_sub_udf_timeout);
 		break;
 	default:
@@ -229,8 +248,23 @@ udf_def_init_from_msg(udf_def* def, const as_transaction* tr)
 		return NULL;
 	}
 
-	as_msg_field_get_strncpy(filename, def->filename, sizeof(def->filename));
-	as_msg_field_get_strncpy(function, def->function, sizeof(def->function));
+	uint32_t filename_len = as_msg_field_get_value_sz(filename);
+
+	if (filename_len >= sizeof(def->filename)) {
+		return NULL;
+	}
+
+	uint32_t function_len = as_msg_field_get_value_sz(function);
+
+	if (function_len >= sizeof(def->function)) {
+		return NULL;
+	}
+
+	memcpy(def->filename, filename->data, filename_len);
+	def->filename[filename_len] = '\0';
+
+	memcpy(def->function, function->data, function_len);
+	def->function[function_len] = '\0';
 
 	as_unpacker unpacker;
 
@@ -264,14 +298,14 @@ as_udf_start(as_transaction* tr)
 
 	// Apply XDR filter.
 	if (! xdr_allows_write(tr)) {
-		tr->result_code = AS_PROTO_RESULT_FAIL_ALWAYS_FORBIDDEN;
+		tr->result_code = AS_ERR_ALWAYS_FORBIDDEN;
 		send_udf_response(tr, NULL);
 		return TRANS_DONE_ERROR;
 	}
 
 	// Don't know if UDF is read or delete - check that we aren't backed up.
 	if (as_storage_overloaded(tr->rsv.ns)) {
-		tr->result_code = AS_PROTO_RESULT_FAIL_DEVICE_OVERLOAD;
+		tr->result_code = AS_ERR_DEVICE_OVERLOAD;
 		send_udf_response(tr, NULL);
 		return TRANS_DONE_ERROR;
 	}
@@ -314,7 +348,7 @@ as_udf_start(as_transaction* tr)
 
 	if (insufficient_replica_destinations(tr->rsv.ns, rw->n_dest_nodes)) {
 		rw_request_hash_delete(&hkey, rw);
-		tr->result_code = AS_PROTO_RESULT_FAIL_UNAVAILABLE;
+		tr->result_code = AS_ERR_UNAVAILABLE;
 		send_udf_response(tr, NULL);
 		return TRANS_DONE_ERROR;
 	}
@@ -395,12 +429,12 @@ start_udf_dup_res(rw_request* rw, as_transaction* tr)
 
 	dup_res_make_message(rw, tr);
 
-	pthread_mutex_lock(&rw->lock);
+	cf_mutex_lock(&rw->lock);
 
 	dup_res_setup_rw(rw, tr, udf_dup_res_cb, udf_timeout_cb);
 	send_rw_messages(rw);
 
-	pthread_mutex_unlock(&rw->lock);
+	cf_mutex_unlock(&rw->lock);
 }
 
 
@@ -411,12 +445,12 @@ start_udf_repl_write(rw_request* rw, as_transaction* tr)
 
 	repl_write_make_message(rw, tr);
 
-	pthread_mutex_lock(&rw->lock);
+	cf_mutex_lock(&rw->lock);
 
 	repl_write_setup_rw(rw, tr, udf_repl_write_cb, udf_timeout_cb);
 	send_rw_messages(rw);
 
-	pthread_mutex_unlock(&rw->lock);
+	cf_mutex_unlock(&rw->lock);
 }
 
 
@@ -439,7 +473,7 @@ udf_dup_res_cb(rw_request* rw)
 	as_transaction tr;
 	as_transaction_init_from_rw(&tr, rw);
 
-	if (tr.result_code != AS_PROTO_RESULT_OK) {
+	if (tr.result_code != AS_OK) {
 		send_udf_response(&tr, NULL);
 		return true;
 	}
@@ -449,7 +483,7 @@ udf_dup_res_cb(rw_request* rw)
 			rw->dest_nodes);
 
 	if (insufficient_replica_destinations(tr.rsv.ns, rw->n_dest_nodes)) {
-		tr.result_code = AS_PROTO_RESULT_FAIL_UNAVAILABLE;
+		tr.result_code = AS_ERR_UNAVAILABLE;
 		send_udf_response(&tr, NULL);
 		return true;
 	}
@@ -573,6 +607,7 @@ send_udf_response(as_transaction* tr, cf_dyn_buf* db)
 					tr->result_code, tr->generation, tr->void_time, NULL, NULL,
 					0, tr->rsv.ns, as_transaction_trid(tr));
 		}
+		from_proxy_udf_update_stats(tr->rsv.ns, tr->result_code);
 		break;
 	case FROM_IUDF:
 		if (db && db->used_sz != 0) {
@@ -602,18 +637,18 @@ udf_timeout_cb(rw_request* rw)
 
 	switch (rw->origin) {
 	case FROM_CLIENT:
-		as_msg_send_reply(rw->from.proto_fd_h, AS_PROTO_RESULT_FAIL_TIMEOUT, 0,
-				0, NULL, NULL, 0, rw->rsv.ns, rw_request_trid(rw));
+		as_msg_send_reply(rw->from.proto_fd_h, AS_ERR_TIMEOUT, 0, 0, NULL, NULL,
+				0, rw->rsv.ns, rw_request_trid(rw));
 		// Timeouts aren't included in histograms.
-		client_udf_update_stats(rw->rsv.ns, AS_PROTO_RESULT_FAIL_TIMEOUT);
+		client_udf_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT);
 		break;
 	case FROM_PROXY:
+		from_proxy_udf_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT);
 		break;
 	case FROM_IUDF:
-		rw->from.iudf_orig->cb(rw->from.iudf_orig->udata,
-				AS_PROTO_RESULT_FAIL_TIMEOUT);
+		rw->from.iudf_orig->cb(rw->from.iudf_orig->udata, AS_ERR_TIMEOUT);
 		// Timeouts aren't included in histograms.
-		udf_sub_udf_update_stats(rw->rsv.ns, AS_PROTO_RESULT_FAIL_TIMEOUT);
+		udf_sub_udf_update_stats(rw->rsv.ns, AS_ERR_TIMEOUT);
 		break;
 	default:
 		cf_crash(AS_RW, "unexpected transaction origin %u", rw->origin);
@@ -641,7 +676,7 @@ udf_master(rw_request* rw, as_transaction* tr)
 	}
 	else if (! udf_def_init_from_msg(call.def, tr)) {
 		cf_warning(AS_UDF, "failed udf_def_init_from_msg");
-		tr->result_code = AS_PROTO_RESULT_FAIL_PARAMETER;
+		tr->result_code = AS_ERR_PARAMETER;
 		return TRANS_DONE_ERROR;
 	}
 
@@ -685,7 +720,7 @@ udf_master_apply(udf_call* call, rw_request* rw)
 	if (tr->origin == FROM_IUDF &&
 			(get_rv == -1 || ! as_record_is_live(r_ref.r))) {
 		// Internal UDFs must not create records.
-		tr->result_code = AS_PROTO_RESULT_FAIL_NOT_FOUND;
+		tr->result_code = AS_ERR_NOT_FOUND;
 		process_failure(call, NULL, &rw->response_db);
 		return UDF_OPTYPE_NONE;
 	}
@@ -711,7 +746,7 @@ udf_master_apply(udf_call* call, rw_request* rw)
 
 		if (udf_storage_record_open(&urecord) != 0) {
 			udf_record_close(&urecord);
-			tr->result_code = AS_PROTO_RESULT_FAIL_BIN_NAME; // overloaded... add bin_count error?
+			tr->result_code = AS_ERR_BIN_NAME; // overloaded... add bin_count error?
 			process_failure(call, NULL, &rw->response_db);
 			return UDF_OPTYPE_NONE;
 		}
@@ -724,7 +759,7 @@ udf_master_apply(udf_call* call, rw_request* rw)
 			if (! predexp_matches_record(tr->from.iudf_orig->predexp,
 					&predargs)) {
 				udf_record_close(&urecord);
-				tr->result_code = AS_PROTO_RESULT_FAIL_NOT_FOUND; // not ideal
+				tr->result_code = AS_ERR_NOT_FOUND; // not ideal
 				process_failure(call, NULL, &rw->response_db);
 				return UDF_OPTYPE_NONE;
 			}
@@ -736,7 +771,7 @@ udf_master_apply(udf_call* call, rw_request* rw)
 		if (rd.key) {
 			if (as_transaction_has_key(tr) && ! check_msg_key(m, &rd)) {
 				udf_record_close(&urecord);
-				tr->result_code = AS_PROTO_RESULT_FAIL_KEY_MISMATCH;
+				tr->result_code = AS_ERR_KEY_MISMATCH;
 				process_failure(call, NULL, &rw->response_db);
 				return UDF_OPTYPE_NONE;
 			}
@@ -745,7 +780,7 @@ udf_master_apply(udf_call* call, rw_request* rw)
 			// If the message has a key, apply it to the record.
 			if (! get_msg_key(tr, &rd)) {
 				udf_record_close(&urecord);
-				tr->result_code = AS_PROTO_RESULT_FAIL_UNSUPPORTED_FEATURE;
+				tr->result_code = AS_ERR_UNSUPPORTED_FEATURE;
 				process_failure(call, NULL, &rw->response_db);
 				return UDF_OPTYPE_NONE;
 			}
@@ -784,7 +819,7 @@ udf_master_apply(udf_call* call, rw_request* rw)
 
 		char* rs = as_module_err_string(apply_rv);
 
-		tr->result_code = AS_PROTO_RESULT_FAIL_UDF_EXECUTION;
+		tr->result_code = AS_ERR_UDF_EXECUTION;
 		process_failure_str(call, rs, strlen(rs), &rw->response_db);
 		cf_free(rs);
 	}
@@ -802,15 +837,18 @@ udf_master_apply(udf_call* call, rw_request* rw)
 int
 udf_apply_record(udf_call* call, as_rec* rec, as_result* result)
 {
-	time_tracker udf_timer_tracker = {
-		.udata		= as_rec_source(rec),
-		.end_time	= udf_end_time
-	};
-
-	udf_timer_setup(&udf_timer_tracker);
+	// timedout callback gives no 'udata' per UDF - use thread-local.
+	g_end_ns = ((udf_record*)rec->data)->tr->end_time;
 
 	as_timer timer;
-	as_timer_init(&timer, &udf_timer_tracker, &udf_timer_hooks);
+
+	static const as_timer_hooks udf_timer_hooks = {
+		.destroy	= NULL,
+		.timedout	= udf_timer_timedout,
+		.timeslice	= udf_timer_timeslice
+	};
+
+	as_timer_init(&timer, NULL, &udf_timer_hooks);
 
 	as_udf_context ctx = {
 		.as			= &g_as_aerospike,
@@ -818,25 +856,8 @@ udf_apply_record(udf_call* call, as_rec* rec, as_result* result)
 		.memtracker	= NULL
 	};
 
-	int apply_rv = as_module_apply_record(&mod_lua, &ctx, call->def->filename,
+	return as_module_apply_record(&mod_lua, &ctx, call->def->filename,
 			call->def->function, rec, call->def->arglist, result);
-
-	udf_timer_cleanup();
-
-	return apply_rv;
-}
-
-
-uint64_t
-udf_end_time(time_tracker* tt)
-{
-	udf_record* urecord = (udf_record*)tt->udata;
-
-	if (! urecord) {
-		return -1; // TODO - should be impossible.
-	}
-
-	return urecord->tr->end_time;
 }
 
 
@@ -885,6 +906,7 @@ udf_post_processing(udf_record* urecord, rw_request* rw, udf_optype urecord_op)
 {
 	as_storage_rd* rd = urecord->rd;
 	as_transaction* tr = urecord->tr;
+	as_namespace* ns = rd->ns;
 	as_record* r = rd->r;
 
 	uint16_t generation = 0;
@@ -909,29 +931,15 @@ udf_post_processing(udf_record* urecord, rw_request* rw, udf_optype urecord_op)
 		tr->void_time = r->void_time;
 		tr->last_update_time = r->last_update_time;
 
-		// Now ok to accommodate a new stored key...
-		if (r->key_stored == 0 && rd->key) {
-			if (rd->ns->storage_data_in_memory) {
-				as_record_allocate_key(r, rd->key, rd->key_size);
-			}
-
-			r->key_stored = 1;
-		}
-		// ... or drop a stored key.
-		else if (r->key_stored == 1 && ! rd->key) {
-			if (rd->ns->storage_data_in_memory) {
-				as_record_remove_key(r);
-			}
-
-			r->key_stored = 0;
-		}
+		// Store or drop the key as appropriate.
+		as_record_finalize_key(r, ns, rd->key, rd->key_size);
 
 		as_storage_record_adjust_mem_stats(rd, urecord->starting_memory_bytes);
 
-		will_replicate(r, rd->ns);
+		will_replicate(r, ns);
 
 		// Collect information for XDR before closing the record.
-		generation = plain_generation(r->generation, rd->ns);
+		generation = plain_generation(r->generation, ns);
 		set_id = as_index_get_set_id(r);
 
 		if (urecord->dirty && urecord_op == UDF_OPTYPE_WRITE) {
@@ -957,6 +965,30 @@ udf_post_processing(udf_record* urecord, rw_request* rw, udf_optype urecord_op)
 }
 
 
+bool
+udf_timer_timedout(const as_timer* timer)
+{
+	uint64_t now = cf_getns();
+
+	if (now < g_end_ns) {
+		return false;
+	}
+
+	cf_warning(AS_UDF, "UDF timed out %lu ms ago", (now - g_end_ns) / 1000000);
+
+	return true;
+}
+
+
+uint64_t
+udf_timer_timeslice(const as_timer* timer)
+{
+	uint64_t now = cf_getns();
+
+	return g_end_ns > now ? (g_end_ns - now) / 1000000 : 1;
+}
+
+
 //==========================================================
 // Local helpers - statistics.
 //
@@ -969,40 +1001,54 @@ update_lua_complete_stats(uint8_t origin, as_namespace* ns, udf_optype op,
 	case FROM_CLIENT:
 		if (ret == 0 && is_success) {
 			if (op == UDF_OPTYPE_READ) {
-				cf_atomic_int_incr(&ns->n_client_lang_read_success);
+				cf_atomic64_incr(&ns->n_client_lang_read_success);
 			}
 			else if (op == UDF_OPTYPE_DELETE) {
-				cf_atomic_int_incr(&ns->n_client_lang_delete_success);
+				cf_atomic64_incr(&ns->n_client_lang_delete_success);
 			}
 			else if (op == UDF_OPTYPE_WRITE) {
-				cf_atomic_int_incr(&ns->n_client_lang_write_success);
+				cf_atomic64_incr(&ns->n_client_lang_write_success);
 			}
 		}
 		else {
 			cf_info(AS_UDF, "lua error, ret:%d", ret);
-			cf_atomic_int_incr(&ns->n_client_lang_error);
+			cf_atomic64_incr(&ns->n_client_lang_error);
 		}
 		break;
 	case FROM_PROXY:
-		// TODO?
+		if (ret == 0 && is_success) {
+			if (op == UDF_OPTYPE_READ) {
+				cf_atomic64_incr(&ns->n_from_proxy_lang_read_success);
+			}
+			else if (op == UDF_OPTYPE_DELETE) {
+				cf_atomic64_incr(&ns->n_from_proxy_lang_delete_success);
+			}
+			else if (op == UDF_OPTYPE_WRITE) {
+				cf_atomic64_incr(&ns->n_from_proxy_lang_write_success);
+			}
+		}
+		else {
+			cf_info(AS_UDF, "lua error, ret:%d", ret);
+			cf_atomic64_incr(&ns->n_from_proxy_lang_error);
+		}
 		break;
 	case FROM_IUDF:
 		if (ret == 0 && is_success) {
 			if (op == UDF_OPTYPE_READ) {
 				// Note - this would be weird, since there's nowhere for a
 				// response to go in our current UDF scans & queries.
-				cf_atomic_int_incr(&ns->n_udf_sub_lang_read_success);
+				cf_atomic64_incr(&ns->n_udf_sub_lang_read_success);
 			}
 			else if (op == UDF_OPTYPE_DELETE) {
-				cf_atomic_int_incr(&ns->n_udf_sub_lang_delete_success);
+				cf_atomic64_incr(&ns->n_udf_sub_lang_delete_success);
 			}
 			else if (op == UDF_OPTYPE_WRITE) {
-				cf_atomic_int_incr(&ns->n_udf_sub_lang_write_success);
+				cf_atomic64_incr(&ns->n_udf_sub_lang_write_success);
 			}
 		}
 		else {
 			cf_info(AS_UDF, "lua error, ret:%d", ret);
-			cf_atomic_int_incr(&ns->n_udf_sub_lang_error);
+			cf_atomic64_incr(&ns->n_udf_sub_lang_error);
 		}
 		break;
 	default:
@@ -1046,7 +1092,7 @@ process_result(const as_result* result, udf_call* call, cf_dyn_buf* db)
 	// Failures...
 
 	if (as_val_type(val) == AS_STRING) {
-		call->tr->result_code = AS_PROTO_RESULT_FAIL_UDF_EXECUTION;
+		call->tr->result_code = AS_ERR_UDF_EXECUTION;
 		process_failure(call, val, db);
 		return;
 	}
@@ -1056,7 +1102,7 @@ process_result(const as_result* result, udf_call* call, cf_dyn_buf* db)
 			"%s:0: in function %s() - error() argument type not handled",
 			call->def->filename, call->def->function);
 
-	call->tr->result_code = AS_PROTO_RESULT_FAIL_UDF_EXECUTION;
+	call->tr->result_code = AS_ERR_UDF_EXECUTION;
 	process_failure_str(call, lua_err_str, len, db);
 }
 

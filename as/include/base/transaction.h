@@ -23,7 +23,6 @@
 
 #pragma once
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -37,12 +36,8 @@
 #include "node.h"
 #include "socket.h"
 
-#include "base/cfg.h"
-#include "base/index.h"
 #include "base/proto.h"
-#include "base/stats.h"
 #include "fabric/partition.h"
-#include "storage/storage.h"
 
 struct as_namespace_s;
 
@@ -109,19 +104,17 @@ struct as_namespace_s;
 
 typedef struct as_file_handle_s {
 	char		client[64];		// client identifier (currently ip-addr:port)
-	uint64_t	last_used;		// last ms we read or wrote
-	cf_socket	sock;			// our socket
+	uint64_t	last_used;		// last nanoseconds we read or wrote
+	cf_socket	sock;			// our client socket
 	cf_poll		poll;			// our epoll instance
-	bool		reap_me;		// tells the reaper to come and get us
-	uint32_t	fh_info;		// bitmap containing status info of this file handle
-	as_proto	proto_hdr;
-	as_proto	*proto;
-	uint64_t	proto_unread;
+	bool		reap_me;		// force reaping (overrides do_not_reap)
+	bool		do_not_reap;	// don't reap during mid-transaction idle
+	bool		is_xdr;			// XDR client connection
+	as_proto	proto_hdr;		// space for header when reading it from socket
+	as_proto	*proto;			// complete request message
+	uint64_t	proto_unread;	// bytes not yet read from socket
 	void		*security_filter;
 } as_file_handle;
-
-#define FH_INFO_DONOT_REAP	0x00000001	// this bit indicates that this file handle should not be reaped
-#define FH_INFO_XDR			0x00000002	// the file handle belongs to an XDR connection
 
 // Helpers to release transaction file handles.
 void as_release_file_handle(as_file_handle *proto_fd_h);
@@ -148,14 +141,13 @@ typedef enum {
 // FROM_FLAG_BATCH_SUB.
 //
 typedef enum {
-	// External, comes through demarshal or fabric:
+	// External, comes through service or fabric:
 	FROM_CLIENT	= 1,
 	FROM_PROXY,
 
 	// Internal, generated on local node:
 	FROM_BATCH,
 	FROM_IUDF,
-	FROM_NSUP,
 	FROM_RE_REPL, // enterprise-only
 
 	FROM_UNDEF	= 0
@@ -218,13 +210,16 @@ typedef struct as_transaction_s {
 #define AS_TRANSACTION_HEAD_SIZE (offsetof(as_transaction, rsv))
 
 // 'from_flags' bits - set before queuing transaction head:
-#define FROM_FLAG_BATCH_SUB		0x0001
-#define FROM_FLAG_RESTART		0x0002
+#define FROM_FLAG_BATCH_SUB			0x0001
+#define FROM_FLAG_RESTART			0x0002
+#define FROM_FLAG_RESTART_STRICT	0x0004 // enterprise-only
 
 // 'flags' bits - set in transaction body after queuing:
 #define AS_TRANSACTION_FLAG_SINDEX_TOUCHED	0x01
 #define AS_TRANSACTION_FLAG_IS_DELETE		0x02
 #define AS_TRANSACTION_FLAG_MUST_PING		0x04 // enterprise-only
+#define AS_TRANSACTION_FLAG_RSV_PROLE		0x08 // enterprise-only
+#define AS_TRANSACTION_FLAG_RSV_UNAVAILABLE	0x10 // enterprise-only
 
 
 void as_transaction_init_head(as_transaction *tr, cf_digest *, cl_msg *);
@@ -250,6 +245,12 @@ static inline bool
 as_transaction_is_batch_sub(const as_transaction *tr)
 {
 	return (tr->from_flags & FROM_FLAG_BATCH_SUB) != 0;
+}
+
+static inline bool
+as_transaction_is_restart_strict(const as_transaction *tr)
+{
+	return (tr->from_flags & FROM_FLAG_RESTART_STRICT) != 0;
 }
 
 static inline bool
@@ -367,15 +368,23 @@ as_transaction_is_xdr(const as_transaction *tr)
 }
 
 static inline bool
-as_transaction_is_nsup_delete(const as_transaction *tr)
+as_transaction_is_linearized_read(const as_transaction *tr)
 {
-	return tr->origin == FROM_NSUP;
+	return (tr->msgp->msg.info3 & AS_MSG_INFO3_SC_READ_RELAX) == 0 &&
+			(tr->msgp->msg.info3 & AS_MSG_INFO3_SC_READ_TYPE) != 0;
 }
 
 static inline bool
-as_transaction_is_linearized_read(const as_transaction *tr)
+as_transaction_is_allow_unavailable_read(const as_transaction *tr)
 {
-	return (tr->msgp->msg.info3 & AS_MSG_INFO3_LINEARIZE_READ) != 0;
+	return (tr->msgp->msg.info3 & AS_MSG_INFO3_SC_READ_RELAX) != 0 &&
+			(tr->msgp->msg.info3 & AS_MSG_INFO3_SC_READ_TYPE) != 0;
+}
+
+static inline bool
+as_transaction_is_strict_read(const as_transaction *tr)
+{
+	return (tr->msgp->msg.info3 & AS_MSG_INFO3_SC_READ_RELAX) == 0;
 }
 
 void as_transaction_init_iudf(as_transaction *tr, struct as_namespace_s *ns, cf_digest *keyd, struct iudf_origin_s *iudf_orig, bool is_durable_delete);

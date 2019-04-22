@@ -147,21 +147,23 @@ as_namespace_create(char *name)
 	ns->ns_allow_xdr_writes = true; // allow xdr writes by default
 	cf_vector_pointer_init(&ns->xdr_dclist_v, 3, 0);
 
-	ns->cold_start_evict_ttl = 0xFFFFffff; // unless this is specified via config file, use evict void-time saved in device header
 	ns->conflict_resolution_policy = AS_NAMESPACE_CONFLICT_RESOLUTION_POLICY_UNDEF;
 	ns->evict_hist_buckets = 10000; // for 30 day TTL, bucket width is 4 minutes 20 seconds
 	ns->evict_tenths_pct = 5; // default eviction amount is 0.5%
 	ns->hwm_disk_pct = 50; // evict when device usage exceeds 50%
 	ns->hwm_memory_pct = 60; // evict when memory usage exceeds 50% of namespace memory-size
 	ns->index_stage_size = 1024L * 1024L * 1024L; // 1G
-	ns->max_ttl = MAX_ALLOWED_TTL; // 10 years
 	ns->migrate_order = 5;
 	ns->migrate_retransmit_ms = 1000 * 5; // 5 seconds
 	ns->migrate_sleep = 1;
+	ns->nsup_hist_period = 60 * 60; // 1 hour
+	ns->nsup_period = 2 * 60; // 2 minutes
+	ns->n_nsup_threads = 1;
 	ns->read_consistency_level = AS_READ_CONSISTENCY_LEVEL_PROTO;
 	ns->stop_writes_pct = 90; // stop writes when 90% of either memory or disk is used
 	ns->tomb_raider_eligible_age = 60 * 60 * 24; // 1 day
 	ns->tomb_raider_period = 60 * 60 * 24; // 1 day
+	ns->transaction_pending_limit = 20;
 	ns->tree_shared.n_sprigs = NUM_LOCK_PAIRS; // can't be less than number of lock pairs, 256 per partition
 	ns->write_commit_level = AS_WRITE_COMMIT_LEVEL_PROTO;
 
@@ -177,6 +179,7 @@ as_namespace_create(char *name)
 	ns->storage_defrag_lwm_pct = 50; // defrag if occupancy of block is < 50%
 	ns->storage_defrag_sleep = 1000; // sleep this many microseconds between each wblock
 	ns->storage_defrag_startup_minimum = 10; // defrag until >= 10% disk is writable before joining cluster
+	ns->storage_encryption = AS_ENCRYPTION_AES_128;
 	ns->storage_flush_max_us = 1000 * 1000; // wait this many microseconds before flushing inactive current write buffer (0 = never)
 	ns->storage_max_write_cache = 1024 * 1024 * 64;
 	ns->storage_min_avail_pct = 5; // stop writes when < 5% disk is writable

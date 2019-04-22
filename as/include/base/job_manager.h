@@ -22,13 +22,14 @@
 
 #pragma once
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_queue.h"
 #include "citrusleaf/cf_queue_priority.h"
+
+#include "cf_mutex.h"
 
 struct as_job_s;
 struct as_job_manager_s;
@@ -42,7 +43,7 @@ struct as_partition_reservation_s;
 //
 
 typedef struct as_priority_thread_pool_s {
-	pthread_mutex_t		lock;
+	cf_mutex			lock;
 	cf_queue_priority*	dispatch_queue;
 	cf_queue*			complete_queue;
 	uint32_t			n_threads;
@@ -89,11 +90,11 @@ typedef enum {
 #define AS_JOB_PRIORITY_HIGH	THREAD_POOL_PRIORITY_HIGH
 
 // Same as proto result codes so connected scans don't have to convert:
-#define AS_JOB_FAIL_UNKNOWN		AS_PROTO_RESULT_FAIL_UNKNOWN
-#define AS_JOB_FAIL_PARAMETER	AS_PROTO_RESULT_FAIL_PARAMETER
-#define AS_JOB_FAIL_CLUSTER_KEY	AS_PROTO_RESULT_FAIL_CLUSTER_KEY_MISMATCH
-#define AS_JOB_FAIL_USER_ABORT	AS_PROTO_RESULT_FAIL_SCAN_ABORT
-#define AS_JOB_FAIL_FORBIDDEN	AS_PROTO_RESULT_FAIL_FORBIDDEN
+#define AS_JOB_FAIL_UNKNOWN		AS_ERR_UNKNOWN
+#define AS_JOB_FAIL_PARAMETER	AS_ERR_PARAMETER
+#define AS_JOB_FAIL_CLUSTER_KEY	AS_ERR_CLUSTER_KEY_MISMATCH
+#define AS_JOB_FAIL_USER_ABORT	AS_ERR_SCAN_ABORT
+#define AS_JOB_FAIL_FORBIDDEN	AS_ERR_FORBIDDEN
 
 // These result codes can't make it back to the client, but show in monitor:
 #define AS_JOB_FAIL_RESPONSE_ERROR		(-1)
@@ -117,13 +118,14 @@ typedef struct as_job_s {
 	uint16_t					set_id;
 
 	// Handle active phase:
-	pthread_mutex_t				requeue_lock;
+	cf_mutex					requeue_lock;
 	int							priority;
 	cf_atomic32					active_rc;
 	volatile int				next_pid;
 	volatile int				abandoned;
 
 	// For tracking:
+	char						client[64];
 	uint64_t					start_ms;
 	uint64_t					finish_ms;
 	cf_atomic64					n_records_read;
@@ -131,8 +133,8 @@ typedef struct as_job_s {
 
 void as_job_init(as_job* _job, const as_job_vtable* vtable,
 		struct as_job_manager_s* manager, as_job_rsv_type rsv_type,
-		uint64_t trid, struct as_namespace_s* ns, uint16_t set_id,
-		int priority);
+		uint64_t trid, struct as_namespace_s* ns, uint16_t set_id, int priority,
+		const char* client);
 void as_job_slice(void* task);
 void as_job_finish(as_job* _job);
 void as_job_destroy(as_job* _job);
@@ -145,7 +147,7 @@ void as_job_active_release(as_job* _job);
 //
 
 typedef struct as_job_manager_s {
-	pthread_mutex_t			lock;
+	cf_mutex				lock;
 	cf_queue*				active_jobs;
 	cf_queue*				finished_jobs;
 	as_priority_thread_pool	thread_pool;

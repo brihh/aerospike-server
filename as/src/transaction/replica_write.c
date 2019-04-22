@@ -26,7 +26,6 @@
 
 #include "transaction/replica_write.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -35,12 +34,14 @@
 #include "citrusleaf/cf_clock.h"
 #include "citrusleaf/cf_digest.h"
 
+#include "cf_mutex.h"
 #include "fault.h"
 #include "msg.h"
 #include "node.h"
 
 #include "base/cfg.h"
 #include "base/datamodel.h"
+#include "base/health.h"
 #include "base/index.h"
 #include "base/proto.h"
 #include "base/secondary_index.h"
@@ -62,7 +63,7 @@ uint32_t pack_info_bits(as_transaction* tr);
 void send_repl_write_ack(cf_node node, msg* m, uint32_t result);
 uint32_t parse_result_code(msg* m);
 void drop_replica(as_partition_reservation* rsv, cf_digest* keyd,
-		bool is_nsup_delete, bool is_xdr_op, cf_node master);
+		bool is_xdr_op, cf_node master);
 
 
 //==========================================================
@@ -163,6 +164,10 @@ repl_write_setup_rw(rw_request* rw, as_transaction* tr,
 
 	// Allow retransmit thread to destroy rw_request as soon as we unlock.
 	rw->is_set_up = true;
+
+	if (as_health_sample_replica_write()) {
+		rw->repl_start_us = cf_getus();
+	}
 }
 
 
@@ -187,6 +192,10 @@ repl_write_reset_rw(rw_request* rw, as_transaction* tr, repl_write_done_cb cb)
 	for (uint32_t i = 0; i < rw->n_dest_nodes; i++) {
 		rw->dest_complete[i] = false;
 	}
+
+	if (as_health_sample_replica_write()) {
+		rw->repl_start_us = cf_getus();
+	}
 }
 
 
@@ -199,7 +208,7 @@ repl_write_handle_op(cf_node node, msg* m)
 	if (msg_get_buf(m, RW_FIELD_NAMESPACE, &ns_name, &ns_name_len,
 			MSG_GET_DIRECT) != 0) {
 		cf_warning(AS_RW, "repl_write_handle_op: no namespace");
-		send_repl_write_ack(node, m, AS_PROTO_RESULT_FAIL_UNKNOWN);
+		send_repl_write_ack(node, m, AS_ERR_UNKNOWN);
 		return;
 	}
 
@@ -207,7 +216,7 @@ repl_write_handle_op(cf_node node, msg* m)
 
 	if (! ns) {
 		cf_warning(AS_RW, "repl_write_handle_op: invalid namespace");
-		send_repl_write_ack(node, m, AS_PROTO_RESULT_FAIL_UNKNOWN);
+		send_repl_write_ack(node, m, AS_ERR_UNKNOWN);
 		return;
 	}
 
@@ -216,7 +225,7 @@ repl_write_handle_op(cf_node node, msg* m)
 	if (msg_get_buf(m, RW_FIELD_DIGEST, (uint8_t**)&keyd, NULL,
 			MSG_GET_DIRECT) != 0) {
 		cf_warning(AS_RW, "repl_write_handle_op: no digest");
-		send_repl_write_ack(node, m, AS_PROTO_RESULT_FAIL_UNKNOWN);
+		send_repl_write_ack(node, m, AS_ERR_UNKNOWN);
 		return;
 	}
 
@@ -224,7 +233,7 @@ repl_write_handle_op(cf_node node, msg* m)
 	uint32_t result = as_partition_reserve_replica(ns, as_partition_getid(keyd),
 			&rsv);
 
-	if (result != AS_PROTO_RESULT_OK) {
+	if (result != AS_OK) {
 		send_repl_write_ack(node, m, result);
 		return;
 	}
@@ -235,7 +244,7 @@ repl_write_handle_op(cf_node node, msg* m)
 			&rr.record_buf_sz, MSG_GET_DIRECT) != 0 || rr.record_buf_sz < 2) {
 		cf_warning(AS_RW, "repl_write_handle_op: no or bad record");
 		as_partition_release(&rsv);
-		send_repl_write_ack(node, m, AS_PROTO_RESULT_FAIL_UNKNOWN);
+		send_repl_write_ack(node, m, AS_ERR_UNKNOWN);
 		return;
 	}
 
@@ -244,13 +253,10 @@ repl_write_handle_op(cf_node node, msg* m)
 	msg_get_uint32(m, RW_FIELD_INFO, &info);
 
 	if (repl_write_pickle_is_drop(rr.record_buf, info)) {
-		drop_replica(&rsv, keyd,
-				(info & RW_INFO_NSUP_DELETE) != 0,
-				(info & RW_INFO_XDR) != 0,
-				node);
+		drop_replica(&rsv, keyd, (info & RW_INFO_XDR) != 0, node);
 
 		as_partition_release(&rsv);
-		send_repl_write_ack(node, m, AS_PROTO_RESULT_OK);
+		send_repl_write_ack(node, m, AS_OK);
 
 		return;
 	}
@@ -259,7 +265,7 @@ repl_write_handle_op(cf_node node, msg* m)
 			rr.generation == 0) {
 		cf_warning(AS_RW, "repl_write_handle_op: no or bad generation");
 		as_partition_release(&rsv);
-		send_repl_write_ack(node, m, AS_PROTO_RESULT_FAIL_UNKNOWN);
+		send_repl_write_ack(node, m, AS_ERR_UNKNOWN);
 		return;
 	}
 
@@ -267,7 +273,7 @@ repl_write_handle_op(cf_node node, msg* m)
 			&rr.last_update_time) != 0) {
 		cf_warning(AS_RW, "repl_write_handle_op: no last-update-time");
 		as_partition_release(&rsv);
-		send_repl_write_ack(node, m, AS_PROTO_RESULT_FAIL_UNKNOWN);
+		send_repl_write_ack(node, m, AS_ERR_UNKNOWN);
 		return;
 	}
 
@@ -331,23 +337,20 @@ repl_write_handle_ack(cf_node node, msg* m)
 		return;
 	}
 
-	pthread_mutex_lock(&rw->lock);
+	cf_mutex_lock(&rw->lock);
 
 	if (rw->tid != tid || rw->repl_write_complete) {
 		// Extra ack - rw_request is newer transaction for same digest, or ack
 		// is arriving after rw_request was aborted.
-		pthread_mutex_unlock(&rw->lock);
+		cf_mutex_unlock(&rw->lock);
 		rw_request_release(rw);
 		as_fabric_msg_put(m);
 		return;
 	}
 
-	// Paranoia - remove eventually.
-	cf_assert(rw->origin != FROM_NSUP, AS_RW, "nsup delete got repl-write ack");
-
 	if (! rw->from.any) {
 		// Lost race against timeout in retransmit thread.
-		pthread_mutex_unlock(&rw->lock);
+		cf_mutex_unlock(&rw->lock);
 		rw_request_release(rw);
 		as_fabric_msg_put(m);
 		return;
@@ -358,7 +361,7 @@ repl_write_handle_ack(cf_node node, msg* m)
 
 	if (i == -1) {
 		cf_warning(AS_RW, "repl-write ack: from non-dest node %lx", node);
-		pthread_mutex_unlock(&rw->lock);
+		cf_mutex_unlock(&rw->lock);
 		rw_request_release(rw);
 		as_fabric_msg_put(m);
 		return;
@@ -366,7 +369,7 @@ repl_write_handle_ack(cf_node node, msg* m)
 
 	if (rw->dest_complete[i]) {
 		// Extra ack for this replica write.
-		pthread_mutex_unlock(&rw->lock);
+		cf_mutex_unlock(&rw->lock);
 		rw_request_release(rw);
 		as_fabric_msg_put(m);
 		return;
@@ -377,7 +380,7 @@ repl_write_handle_ack(cf_node node, msg* m)
 	// If it makes sense, retransmit replicas. Note - rw->dest_complete[i] not
 	// yet set true, so that retransmit will go to this remote node.
 	if (repl_write_should_retransmit_replicas(rw, result_code)) {
-		pthread_mutex_unlock(&rw->lock);
+		cf_mutex_unlock(&rw->lock);
 		rw_request_release(rw);
 		as_fabric_msg_put(m);
 		return;
@@ -385,10 +388,13 @@ repl_write_handle_ack(cf_node node, msg* m)
 
 	rw->dest_complete[i] = true;
 
+	as_health_add_ns_latency(node, ns_id, AS_HEALTH_NS_REPL_LAT,
+			rw->repl_start_us);
+
 	for (uint32_t j = 0; j < rw->n_dest_nodes; j++) {
 		if (! rw->dest_complete[j]) {
 			// Still haven't heard from all replicas.
-			pthread_mutex_unlock(&rw->lock);
+			cf_mutex_unlock(&rw->lock);
 			rw_request_release(rw);
 			as_fabric_msg_put(m);
 			return;
@@ -401,7 +407,7 @@ repl_write_handle_ack(cf_node node, msg* m)
 
 	rw->repl_write_complete = true;
 
-	pthread_mutex_unlock(&rw->lock);
+	cf_mutex_unlock(&rw->lock);
 	rw_request_hash_delete(&hkey, rw);
 	rw_request_release(rw);
 	as_fabric_msg_put(m);
@@ -423,10 +429,6 @@ pack_info_bits(as_transaction* tr)
 
 	if ((tr->flags & AS_TRANSACTION_FLAG_SINDEX_TOUCHED) != 0) {
 		info |= RW_INFO_SINDEX_TOUCHED;
-	}
-
-	if (as_transaction_is_nsup_delete(tr)) {
-		info |= (RW_INFO_NSUP_DELETE | RW_INFO_NO_REPL_ACK);
 	}
 
 	if (respond_on_master_complete(tr)) {
@@ -467,7 +469,7 @@ parse_result_code(msg* m)
 
 	if (msg_get_uint32(m, RW_FIELD_RESULT, &result_code) != 0) {
 		cf_warning(AS_RW, "repl-write ack: no result_code");
-		return AS_PROTO_RESULT_FAIL_UNKNOWN;
+		return AS_ERR_UNKNOWN;
 	}
 
 	return result_code;
@@ -475,8 +477,8 @@ parse_result_code(msg* m)
 
 
 void
-drop_replica(as_partition_reservation* rsv, cf_digest* keyd,
-		bool is_nsup_delete, bool is_xdr_op, cf_node master)
+drop_replica(as_partition_reservation* rsv, cf_digest* keyd, bool is_xdr_op,
+		cf_node master)
 {
 	// Shortcut pointers & flags.
 	as_namespace* ns = rsv->ns;
@@ -500,7 +502,7 @@ drop_replica(as_partition_reservation* rsv, cf_digest* keyd,
 	as_index_delete(tree, keyd);
 	as_record_done(&r_ref, ns);
 
-	if (xdr_must_ship_delete(ns, is_nsup_delete, is_xdr_op)) {
+	if (xdr_must_ship_delete(ns, is_xdr_op)) {
 		xdr_write(ns, keyd, 0, master, XDR_OP_TYPE_DROP, set_id, NULL);
 	}
 }

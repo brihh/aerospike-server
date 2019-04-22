@@ -26,12 +26,13 @@
 // Includes.
 //
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "cf_mutex.h"
+#include "fault.h"
 #include "xmem.h"
 
 
@@ -77,6 +78,7 @@ typedef struct cf_arenax_chunk_s {
 } __attribute__((packed)) cf_arenax_chunk;
 
 // DO NOT access this member data directly - use the API!
+// Caution - changing this struct could break warm or cool restart.
 typedef struct cf_arenax_s {
 	// Configuration (passed in constructors).
 	cf_xmem_type		xmem_type;
@@ -98,7 +100,10 @@ typedef struct cf_arenax_s {
 	uint32_t			at_element_id;
 
 	// Thread safety.
-	pthread_mutex_t		lock;
+	cf_mutex			lock;
+
+	// Pad to maintain warm restart compatibility (lock was pthread mutex).
+	uint8_t				pad[36];
 
 	// Current stages.
 	uint32_t			stage_count;
@@ -113,6 +118,8 @@ typedef struct cf_arenax_s {
 	cf_arenax_chunk*	pool_buf;
 	size_t				pool_i;
 } cf_arenax;
+
+COMPILER_ASSERT(sizeof(cf_arenax) == 144 + (8 * CF_ARENAX_MAX_STAGES));
 
 typedef struct free_element_s {
 	uint32_t			magic;

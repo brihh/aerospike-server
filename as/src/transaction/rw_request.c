@@ -26,7 +26,6 @@
 
 #include "transaction/rw_request.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -35,6 +34,7 @@
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_digest.h"
 
+#include "cf_mutex.h"
 #include "dynbuf.h"
 #include "fault.h"
 
@@ -44,6 +44,16 @@
 #include "base/transaction.h"
 #include "fabric/fabric.h"
 #include "fabric/partition.h"
+
+
+//==========================================================
+// Typedefs & constants.
+//
+
+typedef struct rw_wait_ele_s {
+	uint8_t tr_head[AS_TRANSACTION_HEAD_SIZE];
+	struct rw_wait_ele_s* next;
+} rw_wait_ele;
 
 
 //==========================================================
@@ -76,14 +86,14 @@ rw_request_create(cf_digest* keyd)
 	AS_PARTITION_RESERVATION_INIT(rw->rsv);
 
 	rw->end_time			= 0;
-	rw->result_code			= AS_PROTO_RESULT_OK;
+	rw->result_code			= AS_OK;
 	rw->flags				= 0;
 	rw->generation			= 0;
 	rw->void_time			= 0;
 	rw->last_update_time	= 0;
 	// End of as_transaction look-alike.
 
-	pthread_mutex_init(&rw->lock, NULL);
+	cf_mutex_init(&rw->lock);
 
 	rw->wait_queue_head = NULL;
 	rw->wait_queue_tail = NULL;
@@ -119,11 +129,13 @@ rw_request_create(cf_digest* keyd)
 	rw->n_dest_nodes = 0;
 
 	rw->best_dup_msg = NULL;
-	rw->best_dup_result_code = AS_PROTO_RESULT_OK;
+	rw->best_dup_result_code = AS_OK;
 	rw->best_dup_gen = 0;
 	rw->best_dup_lut = 0;
 
 	rw->tie_was_replicated = false;
+
+	rw->repl_start_us = 0;
 
 	return rw;
 }
@@ -164,15 +176,16 @@ rw_request_destroy(rw_request* rw)
 		as_partition_release(&rw->rsv);
 	}
 
-	pthread_mutex_destroy(&rw->lock);
+	cf_mutex_destroy(&rw->lock);
 
 	rw_wait_ele* e = rw->wait_queue_head;
 
 	while (e) {
 		rw_wait_ele* next = e->next;
+		as_transaction* tr = (as_transaction*)e->tr_head;
 
-		e->tr.from_flags |= FROM_FLAG_RESTART;
-		as_tsvc_enqueue(&e->tr);
+		tr->from_flags |= FROM_FLAG_RESTART;
+		as_tsvc_enqueue(tr);
 
 		cf_free(e);
 		e = next;
@@ -185,7 +198,7 @@ rw_request_wait_q_push(rw_request* rw, as_transaction* tr)
 {
 	rw_wait_ele* e = cf_malloc(sizeof(rw_wait_ele));
 
-	as_transaction_copy_head(&e->tr, tr);
+	as_transaction_copy_head((as_transaction*)e->tr_head, tr);
 	tr->from.any = NULL;
 	tr->msgp = NULL;
 
@@ -210,7 +223,7 @@ rw_request_wait_q_push_head(rw_request* rw, as_transaction* tr)
 	rw_wait_ele* e = cf_malloc(sizeof(rw_wait_ele));
 	cf_assert(e, AS_RW, "alloc rw_wait_ele");
 
-	as_transaction_copy_head(&e->tr, tr);
+	as_transaction_copy_head((as_transaction*)e->tr_head, tr);
 	tr->from.any = NULL;
 	tr->msgp = NULL;
 

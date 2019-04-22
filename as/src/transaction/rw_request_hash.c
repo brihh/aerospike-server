@@ -26,7 +26,6 @@
 
 #include "transaction/rw_request_hash.h"
 
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -37,6 +36,8 @@
 #include "citrusleaf/cf_atomic.h"
 #include "citrusleaf/cf_clock.h"
 
+#include "cf_mutex.h"
+#include "cf_thread.h"
 #include "fault.h"
 #include "msg.h"
 #include "node.h"
@@ -119,15 +120,7 @@ as_rw_init()
 			rw_request_hdestroy, sizeof(rw_request_hkey), 32 * 1024,
 			CF_RCHASH_MANY_LOCK);
 
-	pthread_t thread;
-	pthread_attr_t attrs;
-
-	pthread_attr_init(&attrs);
-	pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_DETACHED);
-
-	if (pthread_create(&thread, &attrs, run_retransmit, NULL) != 0) {
-		cf_crash(AS_RW, "failed to create retransmit thread");
-	}
+	cf_thread_create_detached(run_retransmit, NULL);
 
 	as_fabric_register_msg_fn(M_TYPE_RW, rw_mt, sizeof(rw_mt),
 			RW_MSG_SCRATCH_SIZE, rw_msg_cb, NULL);
@@ -158,11 +151,11 @@ rw_request_hash_insert(rw_request_hkey* hkey, rw_request* rw,
 		}
 		// else - got it - handle "hot key" scenario.
 
-		pthread_mutex_lock(&rw0->lock);
+		cf_mutex_lock(&rw0->lock);
 
 		transaction_status status = handle_hot_key(rw0, tr);
 
-		pthread_mutex_unlock(&rw0->lock);
+		cf_mutex_unlock(&rw0->lock);
 		rw_request_release(rw0);
 
 		return status; // rw_request was not inserted in the hash
@@ -215,30 +208,22 @@ rw_request_hash_fn(const void* key, uint32_t key_size)
 transaction_status
 handle_hot_key(rw_request* rw0, as_transaction* tr)
 {
-	if (rw0->is_set_up &&
-			rw0->origin == FROM_PROXY && tr->origin == FROM_PROXY &&
-			rw0->from.proxy_node == tr->from.proxy_node &&
-			rw0->from_data.proxy_tid == tr->from_data.proxy_tid) {
-		// If the new transaction is a retransmitted proxy request, don't
-		// queue it or reply to origin, just drop it and feign success. (Older
-		// servers will retransmit proxy requests - must handle them.)
+	as_namespace* ns = tr->rsv.ns;
 
-		return TRANS_DONE_SUCCESS;
-	}
-	else if (tr->origin == FROM_RE_REPL) {
+	if (tr->origin == FROM_RE_REPL) {
 		// Always put this transaction at the head of the original rw_request's
 		// queue - it will be retried (first) when the original is complete.
 		rw_request_wait_q_push_head(rw0, tr);
 
 		return TRANS_WAITING;
 	}
-	else if (g_config.transaction_pending_limit != 0 &&
-			rw0->wait_queue_depth > g_config.transaction_pending_limit) {
+	else if (ns->transaction_pending_limit != 0 &&
+			rw0->wait_queue_depth > ns->transaction_pending_limit) {
 		// If we're over the hot key pending limit, fail this transaction.
-		cf_detail_digest(AS_RW, &tr->keyd, "{%s} key busy ", tr->rsv.ns->name);
+		cf_detail_digest(AS_RW, &tr->keyd, "{%s} key busy ", ns->name);
 
-		cf_atomic64_incr(&tr->rsv.ns->n_fail_key_busy);
-		tr->result_code = AS_PROTO_RESULT_FAIL_KEY_BUSY;
+		cf_atomic64_incr(&ns->n_fail_key_busy);
+		tr->result_code = AS_ERR_KEY_BUSY;
 
 		return TRANS_DONE_ERROR;
 	}
@@ -285,17 +270,17 @@ retransmit_reduce_fn(const void* key, uint32_t keylen, void* data, void* udata)
 	}
 
 	if (now->now_ns > rw->end_time) {
-		pthread_mutex_lock(&rw->lock);
+		cf_mutex_lock(&rw->lock);
 
 		rw->timeout_cb(rw);
 
-		pthread_mutex_unlock(&rw->lock);
+		cf_mutex_unlock(&rw->lock);
 
 		return CF_RCHASH_REDUCE_DELETE;
 	}
 
 	if (rw->xmit_ms < now->now_ms) {
-		pthread_mutex_lock(&rw->lock);
+		cf_mutex_lock(&rw->lock);
 
 		if (rw->from.any) {
 			rw->xmit_ms = now->now_ms + rw->retry_interval_ms;
@@ -306,7 +291,7 @@ retransmit_reduce_fn(const void* key, uint32_t keylen, void* data, void* udata)
 		}
 		// else - lost race against dup-res or repl-write callback.
 
-		pthread_mutex_unlock(&rw->lock);
+		cf_mutex_unlock(&rw->lock);
 	}
 
 	return 0;
@@ -323,6 +308,12 @@ update_retransmit_stats(const rw_request* rw)
 	// Note - only one retransmit thread, so no need for atomic increments.
 
 	switch (rw->origin) {
+	case FROM_PROXY:
+		if (rw_request_is_batch_sub(rw)) {
+			ns->n_retransmit_all_batch_sub_dup_res++;
+			break;
+		}
+		// No break.
 	case FROM_CLIENT: {
 			bool is_write = (m->info2 & AS_MSG_INFO2_WRITE) != 0;
 			bool is_delete = (m->info2 & AS_MSG_INFO2_DELETE) != 0;
@@ -331,40 +322,37 @@ update_retransmit_stats(const rw_request* rw)
 			if (is_dup_res) {
 				if (is_write) {
 					if (is_delete) {
-						ns->n_retransmit_client_delete_dup_res++;
+						ns->n_retransmit_all_delete_dup_res++;
 					}
 					else if (is_udf) {
-						ns->n_retransmit_client_udf_dup_res++;
+						ns->n_retransmit_all_udf_dup_res++;
 					}
 					else {
-						ns->n_retransmit_client_write_dup_res++;
+						ns->n_retransmit_all_write_dup_res++;
 					}
 				}
 				else {
-					ns->n_retransmit_client_read_dup_res++;
+					ns->n_retransmit_all_read_dup_res++;
 				}
 			}
 			else {
 				cf_assert(is_write, AS_RW, "read doing replica write");
 
 				if (is_delete) {
-					ns->n_retransmit_client_delete_repl_write++;
+					ns->n_retransmit_all_delete_repl_write++;
 				}
 				else if (is_udf) {
-					ns->n_retransmit_client_udf_repl_write++;
+					ns->n_retransmit_all_udf_repl_write++;
 				}
 				else {
-					ns->n_retransmit_client_write_repl_write++;
+					ns->n_retransmit_all_write_repl_write++;
 				}
 			}
 		}
 		break;
-	case FROM_PROXY:
-		// For now we don't report proxyee stats.
-		break;
 	case FROM_BATCH:
 		// For now batch sub transactions are read-only.
-		ns->n_retransmit_batch_sub_dup_res++;
+		ns->n_retransmit_all_batch_sub_dup_res++;
 		break;
 	case FROM_IUDF:
 		if (is_dup_res) {

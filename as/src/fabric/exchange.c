@@ -32,6 +32,7 @@
 #include "citrusleaf/cf_clock.h"
 #include "citrusleaf/cf_queue.h"
 
+#include "cf_thread.h"
 #include "dynbuf.h"
 #include "fault.h"
 #include "shash.h"
@@ -234,6 +235,11 @@ typedef struct as_exchange_node_namespace_data_s
  */
 typedef struct as_exchange_node_data_s
 {
+	/**
+	 * Used by exchange listeners during upgrades for compatibility purposes.
+	 */
+	uint32_t compatibility_id;
+
 	/**
 	 * Number of sender's namespaces that have a matching local namespace.
 	 */
@@ -453,6 +459,16 @@ typedef struct as_exchange_s
 	cf_node principal;
 
 	/**
+	 * Used by exchange listeners during upgrades for compatibility purposes.
+	 */
+	uint32_t compatibility_ids[AS_CLUSTER_SZ];
+
+	/**
+	 * Used by exchange listeners during upgrades for compatibility purposes.
+	 */
+	uint32_t min_compatibility_id;
+
+	/**
 	 * Committed cluster generation.
 	 */
 	uint64_t committed_cluster_generation;
@@ -597,7 +613,8 @@ static as_exchange g_exchange = { 0 };
  */
 typedef enum
 {
-	AS_EXCHANGE_REBALANCE_FLAG_UNIFORM = 0x01
+	AS_EXCHANGE_REBALANCE_FLAG_UNIFORM = 0x01,
+	AS_EXCHANGE_REBALANCE_FLAG_QUIESCE = 0x02
 } as_exchange_rebalance_flags;
 
 /**
@@ -618,6 +635,7 @@ typedef enum
 	AS_EXCHANGE_MSG_NS_EVENTUAL_REGIMES,
 	AS_EXCHANGE_MSG_NS_REBALANCE_REGIMES,
 	AS_EXCHANGE_MSG_NS_REBALANCE_FLAGS,
+	AS_EXCHANGE_MSG_COMPATIBILITY_ID,
 
 	NUM_EXCHANGE_MSG_FIELDS
 } as_exchange_msg_fields;
@@ -637,7 +655,8 @@ static const msg_template exchange_msg_template[] = {
 		{ AS_EXCHANGE_MSG_NS_ROSTERS_RACK_IDS, M_FT_MSGPACK },
 		{ AS_EXCHANGE_MSG_NS_EVENTUAL_REGIMES, M_FT_MSGPACK },
 		{ AS_EXCHANGE_MSG_NS_REBALANCE_REGIMES, M_FT_MSGPACK },
-		{ AS_EXCHANGE_MSG_NS_REBALANCE_FLAGS, M_FT_MSGPACK }
+		{ AS_EXCHANGE_MSG_NS_REBALANCE_FLAGS, M_FT_MSGPACK },
+		{ AS_EXCHANGE_MSG_COMPATIBILITY_ID, M_FT_UINT32 }
 };
 
 COMPILER_ASSERT(sizeof(exchange_msg_template) / sizeof(msg_template) ==
@@ -1143,13 +1162,9 @@ exchange_external_event_publisher_start()
 {
 	EXTERNAL_EVENT_PUBLISHER_LOCK();
 	g_external_event_publisher.sys_state = AS_EXCHANGE_SYS_STATE_RUNNING;
-
-	// Start the event publishing thread.
-	if (pthread_create(&g_external_event_publisher.event_publisher_tid, 0,
-			exchange_external_event_publisher_thr, NULL) != 0) {
-		CRASH("could not create event publishing thread: %s",
-				cf_strerror(errno));
-	}
+	g_external_event_publisher.event_publisher_tid =
+			cf_thread_create_joinable(exchange_external_event_publisher_thr,
+					NULL);
 	EXTERNAL_EVENT_PUBLISHER_UNLOCK();
 }
 
@@ -1164,7 +1179,7 @@ external_event_publisher_stop()
 	EXTERNAL_EVENT_PUBLISHER_UNLOCK();
 
 	exchange_external_event_publisher_thr_wakeup();
-	pthread_join(g_external_event_publisher.event_publisher_tid, NULL);
+	cf_thread_join(g_external_event_publisher.event_publisher_tid);
 
 	EXTERNAL_EVENT_PUBLISHER_LOCK();
 	g_external_event_publisher.sys_state = AS_EXCHANGE_SYS_STATE_STOPPED;
@@ -1492,7 +1507,8 @@ exchange_msg_data_payload_set(msg* msg)
 
 	memset(rebalance_flags, 0, sizeof(rebalance_flags));
 
-	pthread_mutex_lock(&g_exchanged_info_lock);
+	msg_set_uint32(msg, AS_EXCHANGE_MSG_COMPATIBILITY_ID,
+			AS_EXCHANGE_COMPATIBILITY_ID);
 
 	for (uint32_t ns_ix = 0; ns_ix < ns_count; ns_ix++) {
 		as_namespace* ns = g_config.namespaces[ns_ix];
@@ -1549,6 +1565,10 @@ exchange_msg_data_payload_set(msg* msg)
 			rebalance_flags[ns_ix] |= AS_EXCHANGE_REBALANCE_FLAG_UNIFORM;
 		}
 
+		if (ns->pending_quiesce) {
+			rebalance_flags[ns_ix] |= AS_EXCHANGE_REBALANCE_FLAG_QUIESCE;
+		}
+
 		if (rebalance_flags[ns_ix] != 0) {
 			have_rebalance_flags = true;
 		}
@@ -1582,8 +1602,6 @@ exchange_msg_data_payload_set(msg* msg)
 		msg_msgpack_list_set_uint32(msg, AS_EXCHANGE_MSG_NS_REBALANCE_FLAGS,
 				rebalance_flags, ns_count);
 	}
-
-	pthread_mutex_unlock(&g_exchanged_info_lock);
 }
 
 /**
@@ -1742,10 +1760,8 @@ exchange_data_msg_send_pending_ack()
 		goto Exit;
 	}
 
-	if (! g_exchange.data_msg) {
-		g_exchange.data_msg = exchange_msg_get(AS_EXCHANGE_MSG_TYPE_DATA);
-		exchange_msg_data_payload_set(g_exchange.data_msg);
-	}
+	// FIXME - temporary assert, until we're sure.
+	cf_assert(g_exchange.data_msg != NULL, AS_EXCHANGE, "payload not built");
 
 	as_clustering_log_cf_node_array(CF_DEBUG, AS_EXCHANGE,
 			"sending exchange data to nodes:", unacked_nodes,
@@ -1893,15 +1909,28 @@ exchange_data_payload_prepare()
 	as_partition_balance_disallow_migrations();
 	as_partition_balance_synchronize_migrations();
 
+	// Ensure ns->smd_roster is synchronized exchanged partition versions.
+	pthread_mutex_lock(&g_exchanged_info_lock);
+
 	for (uint32_t ns_ix = 0; ns_ix < g_config.n_namespaces; ns_ix++) {
+		as_namespace* ns = g_config.namespaces[ns_ix];
+
+		// May change flags on partition versions we're about to exchange.
+		as_partition_balance_protect_roster_set(ns);
+
 		// Append payload for each namespace.
 
 		// TODO - add API to reset dynbuf?
 		g_exchange.self_data_dyn_buf[ns_ix].used_sz = 0;
 
-		exchange_data_namespace_payload_add(g_config.namespaces[ns_ix],
+		exchange_data_namespace_payload_add(ns,
 				&g_exchange.self_data_dyn_buf[ns_ix]);
 	}
+
+	g_exchange.data_msg = exchange_msg_get(AS_EXCHANGE_MSG_TYPE_DATA);
+	exchange_msg_data_payload_set(g_exchange.data_msg);
+
+	pthread_mutex_unlock(&g_exchanged_info_lock);
 
 	EXCHANGE_UNLOCK();
 }
@@ -1917,7 +1946,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 	uint32_t num_namespaces_sent = 0;
 	uint32_t num_namespace_elements_sent = 0;
 
-	if (!msg_msgpack_container_get_count(msg_event->msg,
+	if (!msg_msgpack_list_get_count(msg_event->msg,
 			AS_EXCHANGE_MSG_NAMESPACES, &num_namespaces_sent)
 			|| num_namespaces_sent > AS_NAMESPACE_SZ) {
 		WARNING("received invalid namespaces from node %"PRIx64,
@@ -1925,7 +1954,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 		return 0;
 	}
 
-	if (!msg_msgpack_container_get_count(msg_event->msg,
+	if (!msg_msgpack_list_get_count(msg_event->msg,
 			AS_EXCHANGE_MSG_NS_PARTITION_VERSIONS, &num_namespace_elements_sent)
 			|| num_namespaces_sent != num_namespace_elements_sent) {
 		WARNING("received invalid partition versions from node %"PRIx64,
@@ -1933,7 +1962,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 		return 0;
 	}
 
-	if (!msg_msgpack_container_get_count(msg_event->msg,
+	if (!msg_msgpack_list_get_count(msg_event->msg,
 			AS_EXCHANGE_MSG_NS_RACK_IDS, &num_namespace_elements_sent)
 			|| num_namespaces_sent != num_namespace_elements_sent) {
 		WARNING("received invalid cluster groups from node %"PRIx64,
@@ -1942,7 +1971,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 	}
 
 	if (msg_is_set(msg_event->msg, AS_EXCHANGE_MSG_NS_ROSTER_GENERATIONS)
-			&& (!msg_msgpack_container_get_count(msg_event->msg,
+			&& (!msg_msgpack_list_get_count(msg_event->msg,
 					AS_EXCHANGE_MSG_NS_ROSTER_GENERATIONS,
 					&num_namespace_elements_sent)
 					|| num_namespaces_sent != num_namespace_elements_sent)) {
@@ -1952,7 +1981,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 	}
 
 	if (msg_is_set(msg_event->msg, AS_EXCHANGE_MSG_NS_ROSTERS)
-			&& (!msg_msgpack_container_get_count(msg_event->msg,
+			&& (!msg_msgpack_list_get_count(msg_event->msg,
 					AS_EXCHANGE_MSG_NS_ROSTERS,
 					&num_namespace_elements_sent)
 					|| num_namespaces_sent != num_namespace_elements_sent)) {
@@ -1962,7 +1991,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 	}
 
 	if (msg_is_set(msg_event->msg, AS_EXCHANGE_MSG_NS_ROSTERS_RACK_IDS)
-			&& (!msg_msgpack_container_get_count(msg_event->msg,
+			&& (!msg_msgpack_list_get_count(msg_event->msg,
 					AS_EXCHANGE_MSG_NS_ROSTERS_RACK_IDS,
 					&num_namespace_elements_sent)
 					|| num_namespaces_sent != num_namespace_elements_sent)) {
@@ -1972,7 +2001,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 	}
 
 	if (msg_is_set(msg_event->msg, AS_EXCHANGE_MSG_NS_EVENTUAL_REGIMES)
-			&& (!msg_msgpack_container_get_count(msg_event->msg,
+			&& (!msg_msgpack_list_get_count(msg_event->msg,
 					AS_EXCHANGE_MSG_NS_EVENTUAL_REGIMES,
 					&num_namespace_elements_sent)
 					|| num_namespaces_sent != num_namespace_elements_sent)) {
@@ -1982,7 +2011,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 	}
 
 	if (msg_is_set(msg_event->msg, AS_EXCHANGE_MSG_NS_REBALANCE_REGIMES)
-			&& (!msg_msgpack_container_get_count(msg_event->msg,
+			&& (!msg_msgpack_list_get_count(msg_event->msg,
 					AS_EXCHANGE_MSG_NS_REBALANCE_REGIMES,
 					&num_namespace_elements_sent)
 					|| num_namespaces_sent != num_namespace_elements_sent)) {
@@ -1992,7 +2021,7 @@ exchange_data_msg_get_num_namespaces(as_exchange_event* msg_event)
 	}
 
 	if (msg_is_set(msg_event->msg, AS_EXCHANGE_MSG_NS_REBALANCE_FLAGS)
-			&& (!msg_msgpack_container_get_count(msg_event->msg,
+			&& (!msg_msgpack_list_get_count(msg_event->msg,
 					AS_EXCHANGE_MSG_NS_REBALANCE_FLAGS,
 					&num_namespace_elements_sent)
 					|| num_namespaces_sent != num_namespace_elements_sent)) {
@@ -2490,17 +2519,32 @@ exchange_namespace_payload_pre_commit_for_node(cf_node node,
 			AS_EXCHANGE_REBALANCE_FLAG_UNIFORM) == 0) {
 		ns->prefer_uniform_balance = false;
 	}
+
+	bool is_node_quiesced = (namespace_data->rebalance_flags &
+			AS_EXCHANGE_REBALANCE_FLAG_QUIESCE) != 0;
+
+	if (node == g_config.self_node) {
+		ns->is_quiesced = is_node_quiesced;
+	}
+
+	ns->quiesced[sl_ix] = is_node_quiesced;
 }
 
 /**
  * Commit exchange data for a given node.
  */
 static void
-exchange_data_pre_commit_for_node(cf_node node)
+exchange_data_pre_commit_for_node(cf_node node, uint32_t ix)
 {
 	EXCHANGE_LOCK();
 	as_exchange_node_state node_state;
 	exchange_node_state_get_safe(node, &node_state);
+
+	g_exchange.compatibility_ids[ix] = node_state.data->compatibility_id;
+
+	if (node_state.data->compatibility_id < g_exchange.min_compatibility_id) {
+		g_exchange.min_compatibility_id = node_state.data->compatibility_id;
+	}
 
 	for (uint32_t i = 0; i < node_state.data->num_namespaces; i++) {
 		exchange_namespace_payload_pre_commit_for_node(node,
@@ -2553,6 +2597,10 @@ exchange_exchanging_pre_commit()
 	EXCHANGE_LOCK();
 	pthread_mutex_lock(&g_exchanged_info_lock);
 
+	memset(g_exchange.compatibility_ids, 0,
+			sizeof(g_exchange.compatibility_ids));
+	g_exchange.min_compatibility_id = UINT32_MAX;
+
 	// Reset exchange data for all namespaces.
 	for (int i = 0; i < g_config.n_namespaces; i++) {
 		as_namespace* ns = g_config.namespaces[i];
@@ -2562,6 +2610,9 @@ exchange_exchanging_pre_commit()
 		memset(ns->cluster_versions, 0, sizeof(ns->cluster_versions));
 
 		memset(ns->rack_ids, 0, sizeof(ns->rack_ids));
+
+		ns->is_quiesced = false;
+		memset(ns->quiesced, 0, sizeof(ns->quiesced));
 
 		ns->roster_generation = 0;
 		ns->roster_count = 0;
@@ -2583,7 +2634,7 @@ exchange_exchanging_pre_commit()
 	for (int i = 0; i < num_nodes; i++) {
 		cf_node node;
 		cf_vector_get(&g_exchange.succession_list, i, &node);
-		exchange_data_pre_commit_for_node(node);
+		exchange_data_pre_commit_for_node(node, i);
 	}
 
 	// Collected all exchanged data - do final configuration consistency checks.
@@ -2679,6 +2730,10 @@ exchange_exchanging_data_msg_handle(as_exchange_event* msg_event)
 	exchange_node_state_get_safe(msg_event->msg_source, &node_state);
 
 	if (!node_state.received) {
+		node_state.data->compatibility_id = 0;
+		msg_get_uint32(msg_event->msg, AS_EXCHANGE_MSG_COMPATIBILITY_ID,
+				&node_state.data->compatibility_id);
+
 		uint32_t num_namespaces_sent = exchange_data_msg_get_num_namespaces(
 				msg_event);
 
@@ -3417,11 +3472,10 @@ exchange_stop()
 		return;
 	}
 
-	// Ungaurded state, but this should be ok.
+	// Unguarded state, but this should be ok.
 	g_exchange.sys_state = AS_EXCHANGE_SYS_STATE_SHUTTING_DOWN;
 
-	// Wait for the relanabce send thread to finish.
-	pthread_join(g_exchange.timer_tid, NULL);
+	cf_thread_join(g_exchange.timer_tid);
 
 	EXCHANGE_LOCK();
 
@@ -3449,12 +3503,8 @@ exchange_start()
 
 	g_exchange.sys_state = AS_EXCHANGE_SYS_STATE_RUNNING;
 
-	// Start the timer thread.
-	if (0
-			!= pthread_create(&g_exchange.timer_tid, 0, exchange_timer_thr,
-					&g_exchange)) {
-		CRASH("could not create exchange thread: %s", cf_strerror(errno));
-	}
+	g_exchange.timer_tid = cf_thread_create_joinable(exchange_timer_thr,
+			(void*)&g_exchange);
 
 	DEBUG("exchange module started");
 
@@ -3585,6 +3635,24 @@ cf_node
 as_exchange_principal()
 {
 	return g_exchange.committed_principal;
+}
+
+/**
+ * Used by exchange listeners during upgrades for compatibility purposes.
+ */
+uint32_t*
+as_exchange_compatibility_ids(void)
+{
+	return (uint32_t*)g_exchange.compatibility_ids;
+}
+
+/**
+ * Used by exchange listeners during upgrades for compatibility purposes.
+ */
+uint32_t
+as_exchange_min_compatibility_id(void)
+{
+	return g_exchange.min_compatibility_id;
 }
 
 /**

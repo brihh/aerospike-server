@@ -63,7 +63,9 @@ typedef struct as_stats_s {
 	// Early transaction errors.
 	cf_atomic64		n_demarshal_error;
 	cf_atomic64		n_tsvc_client_error;
+	cf_atomic64		n_tsvc_from_proxy_error;
 	cf_atomic64		n_tsvc_batch_sub_error;
+	cf_atomic64		n_tsvc_from_proxy_batch_sub_error;
 	cf_atomic64		n_tsvc_udf_sub_error;
 
 	// Batch-index stats.
@@ -77,11 +79,6 @@ typedef struct as_stats_s {
 	cf_atomic64		batch_index_huge_buffers; // not in ticker
 	cf_atomic64		batch_index_created_buffers; // not in ticker
 	cf_atomic64		batch_index_destroyed_buffers; // not in ticker
-
-	// "Old" batch stats.
-	cf_atomic64		batch_initiate; // not in ticker
-	cf_atomic64		batch_errors; // not in ticker
-	cf_atomic64		batch_timeout; // not in ticker
 
 	// Query & secondary index stats.
 	cf_atomic64		query_false_positives;
